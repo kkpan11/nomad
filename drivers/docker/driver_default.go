@@ -1,14 +1,18 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 //go:build !windows
 
 package docker
 
 import (
-	docker "github.com/fsouza/go-dockerclient"
+	"github.com/docker/go-connections/nat"
 )
 
-func getPortBinding(ip string, port string) docker.PortBinding {
-	return docker.PortBinding{HostIP: ip, HostPort: port}
+func getPortBinding(ip string, port string) nat.PortBinding {
+	return nat.PortBinding{HostIP: ip, HostPort: port}
+}
+
+func validateImageUser(imageUser, taskUser string, taskDriverConfig *TaskConfig, driverConfig *DriverConfig) error {
+	return nil
 }

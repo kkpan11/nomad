@@ -1,10 +1,11 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package allocrunner
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	hclog "github.com/hashicorp/go-hclog"
@@ -27,6 +28,8 @@ const (
 	// parameter.
 	dockerNetSpecHostnameKey = "docker_sandbox_hostname"
 )
+
+var ErrCNICheckFailed = errors.New("network namespace already exists but was misconfigured")
 
 type networkIsolationSetter interface {
 	SetNetworkIsolation(*drivers.NetworkIsolationSpec)
@@ -132,6 +135,9 @@ func (h *networkHook) Prerun() error {
 		Hostname: interpolatedNetworks[0].Hostname,
 	}
 
+	var checkedOnce bool
+
+CREATE:
 	spec, created, err := h.manager.CreateNetwork(h.alloc.ID, &networkCreateReq)
 	if err != nil {
 		return fmt.Errorf("failed to create network for alloc: %v", err)
@@ -142,10 +148,25 @@ func (h *networkHook) Prerun() error {
 		h.isolationSetter.SetNetworkIsolation(spec)
 	}
 
-	if created {
-		status, err := h.networkConfigurator.Setup(context.TODO(), h.alloc, spec)
+	if spec != nil {
+		status, err := h.networkConfigurator.Setup(context.TODO(), h.alloc, spec, created)
 		if err != nil {
+			// if the netns already existed but is invalid, we get
+			// ErrCNICheckFailed. We'll try to recover from this one time by
+			// recreating the netns from scratch before giving up
+			if errors.Is(err, ErrCNICheckFailed) && !checkedOnce {
+				checkedOnce = true
+				destroyErr := h.manager.DestroyNetwork(h.alloc.ID, spec)
+				if destroyErr != nil {
+					return fmt.Errorf("%w: destroying network to retry failed: %v", err, destroyErr)
+				}
+				goto CREATE
+			}
+
 			return fmt.Errorf("failed to configure networking for alloc: %v", err)
+		}
+		if status == nil {
+			return nil // netns already existed and was correctly configured
 		}
 
 		// If the driver set the sandbox hostname label, then we will use that
@@ -178,12 +199,14 @@ func (h *networkHook) Prerun() error {
 }
 
 func (h *networkHook) Postrun() error {
-	if h.spec == nil {
-		return nil
+
+	// we need the spec for network teardown
+	if h.spec != nil {
+		if err := h.networkConfigurator.Teardown(context.TODO(), h.alloc, h.spec); err != nil {
+			h.logger.Error("failed to cleanup network for allocation, resources may have leaked", "alloc", h.alloc.ID, "error", err)
+		}
 	}
 
-	if err := h.networkConfigurator.Teardown(context.TODO(), h.alloc, h.spec); err != nil {
-		h.logger.Error("failed to cleanup network for allocation, resources may have leaked", "alloc", h.alloc.ID, "error", err)
-	}
+	// issue driver destroy regardless if we have a spec (e.g. cleanup pause container)
 	return h.manager.DestroyNetwork(h.alloc.ID, h.spec)
 }

@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package scheduler
 
@@ -299,6 +299,48 @@ func TestAnnotateTask(t *testing.T) {
 							{
 								Type: structs.DiffTypeAdded,
 								Name: "RTarget",
+								Old:  "",
+								New:  "baz",
+							},
+						},
+					},
+				},
+			},
+			Parent:  &structs.TaskGroupDiff{Type: structs.DiffTypeEdited},
+			Desired: AnnotationForcesInplaceUpdate,
+		},
+		{
+			Diff: &structs.TaskDiff{
+				Type: structs.DiffTypeEdited,
+				Objects: []*structs.ObjectDiff{
+					{
+						Type: structs.DiffTypeAdded,
+						Name: "Affinity",
+						Fields: []*structs.FieldDiff{
+							{
+								Type: structs.DiffTypeAdded,
+								Name: "LTarget",
+								Old:  "",
+								New:  "baz",
+							},
+						},
+					},
+				},
+			},
+			Parent:  &structs.TaskGroupDiff{Type: structs.DiffTypeEdited},
+			Desired: AnnotationForcesInplaceUpdate,
+		},
+		{
+			Diff: &structs.TaskDiff{
+				Type: structs.DiffTypeEdited,
+				Objects: []*structs.ObjectDiff{
+					{
+						Type: structs.DiffTypeAdded,
+						Name: "Spread",
+						Fields: []*structs.FieldDiff{
+							{
+								Type: structs.DiffTypeAdded,
+								Name: "LTarget",
 								Old:  "",
 								New:  "baz",
 							},

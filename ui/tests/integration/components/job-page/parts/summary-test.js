@@ -1,6 +1,6 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 import hbs from 'htmlbars-inline-precompile';
@@ -20,6 +20,7 @@ module('Integration | Component | job-page/parts/summary', function (hooks) {
     this.store = this.owner.lookup('service:store');
     this.server = startMirage();
     this.server.create('namespace');
+    this.server.create('node-pool');
   });
 
   hooks.afterEach(function () {

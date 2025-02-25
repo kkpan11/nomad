@@ -1,6 +1,6 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 // @ts-check
@@ -12,11 +12,7 @@ export default class JobStatusPanelSteadyComponent extends Component {
   @alias('args.job') job;
 
   get allocTypes() {
-    return jobAllocStatuses[this.args.job.type].map((type) => {
-      return {
-        label: type,
-      };
-    });
+    return this.args.job.allocTypes;
   }
 
   /**
@@ -29,15 +25,17 @@ export default class JobStatusPanelSteadyComponent extends Component {
    * @typedef {Object} AllocationStatus
    * @property {HealthStatus} healthy
    * @property {HealthStatus} unhealthy
+   * @property {HealthStatus} health unknown
    */
 
   /**
    * @typedef {Object} AllocationBlock
-   * @property {AllocationStatus} [RUNNING]
-   * @property {AllocationStatus} [PENDING]
-   * @property {AllocationStatus} [FAILED]
-   * @property {AllocationStatus} [LOST]
-   * @property {AllocationStatus} [UNPLACED]
+   * @property {AllocationStatus} [running]
+   * @property {AllocationStatus} [pending]
+   * @property {AllocationStatus} [failed]
+   * @property {AllocationStatus} [lost]
+   * @property {AllocationStatus} [unplaced]
+   * @property {AllocationStatus} [complete]
    */
 
   /**
@@ -141,7 +139,8 @@ export default class JobStatusPanelSteadyComponent extends Component {
     if (this.args.job.type === 'service' || this.args.job.type === 'batch') {
       return this.args.job.taskGroups.reduce((sum, tg) => sum + tg.count, 0);
     } else if (this.atMostOneAllocPerNode) {
-      return this.args.job.allocations.uniqBy('nodeID').length;
+      return this.args.job.allocations.filterBy('nodeID').uniqBy('nodeID')
+        .length;
     } else {
       return this.args.job.count; // TODO: this is probably not the correct totalAllocs count for any type.
     }
@@ -186,6 +185,10 @@ export default class JobStatusPanelSteadyComponent extends Component {
     return this.job.allocations.filter((a) => !a.isOld && a.hasBeenRestarted);
   }
 
+  get runningAllocs() {
+    return this.job.allocations.filter((a) => a.clientStatus === 'running');
+  }
+
   get completedAllocs() {
     return this.job.allocations.filter(
       (a) => !a.isOld && a.clientStatus === 'complete'
@@ -198,5 +201,72 @@ export default class JobStatusPanelSteadyComponent extends Component {
 
   get latestVersionAllocations() {
     return this.job.allocations.filter((a) => !a.isOld);
+  }
+
+  /**
+   * @typedef {Object} CurrentStatus
+   * @property {"Healthy"|"Failed"|"Degraded"|"Recovering"|"Complete"|"Running"|"Stopped"|"Scaled Down"} label - The current status of the job
+   * @property {"highlight"|"success"|"warning"|"critical"|"neutral"} state -
+   */
+
+  /**
+   * A general assessment for how a job is going, in a non-deployment state
+   * @returns {CurrentStatus}
+   */
+  get currentStatus() {
+    // If all allocs are running, the job is Healthy
+    const totalAllocs = this.totalAllocs;
+
+    if (this.job.status === 'dead' && this.job.stopped) {
+      return {
+        label: 'Stopped',
+        state: 'neutral',
+      };
+    }
+
+    if (this.totalAllocs === 0 && !this.job.hasClientStatus) {
+      return {
+        label: 'Scaled Down',
+        state: 'neutral',
+      };
+    }
+
+    if (this.job.type === 'batch' || this.job.type === 'sysbatch') {
+      // If all the allocs are complete, the job is Complete
+      const completeAllocs = this.allocBlocks.complete?.healthy?.nonCanary;
+      if (completeAllocs?.length === totalAllocs) {
+        return { label: 'Complete', state: 'success' };
+      }
+
+      // If any allocations are running the job is "Running"
+      const healthyAllocs = this.allocBlocks.running?.healthy?.nonCanary;
+      if (healthyAllocs?.length + completeAllocs?.length === totalAllocs) {
+        return { label: 'Running', state: 'success' };
+      }
+    }
+
+    const healthyAllocs = this.allocBlocks.running?.healthy?.nonCanary;
+    if (healthyAllocs?.length && healthyAllocs?.length === totalAllocs) {
+      return { label: 'Healthy', state: 'success' };
+    }
+
+    // If any allocations are pending the job is "Recovering"
+    const pendingAllocs = this.allocBlocks.pending?.healthy?.nonCanary;
+    if (pendingAllocs?.length > 0) {
+      return { label: 'Recovering', state: 'highlight' };
+    }
+
+    // If any allocations are failed, lost, or unplaced in a steady state, the job is "Degraded"
+    const failedOrLostAllocs = [
+      ...this.allocBlocks.failed?.healthy?.nonCanary,
+      ...this.allocBlocks.lost?.healthy?.nonCanary,
+      ...this.allocBlocks.unplaced?.healthy?.nonCanary,
+    ];
+
+    if (failedOrLostAllocs.length === totalAllocs) {
+      return { label: 'Failed', state: 'critical' };
+    } else {
+      return { label: 'Degraded', state: 'warning' };
+    }
   }
 }

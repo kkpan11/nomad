@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package taskenv
 
@@ -83,6 +83,30 @@ func Test_InterpolateNetworks(t *testing.T) {
 				},
 			},
 			name: "interpolated dns servers",
+		},
+		{
+			inputTaskEnv: testEnv,
+			inputNetworks: structs.Networks{
+				{
+					CNI: &structs.CNIConfig{
+						Args: map[string]string{
+							"static": "example",
+							"second": "${foo}-opt",
+						},
+					},
+				},
+			},
+			expectedOutputNetworks: structs.Networks{
+				{
+					CNI: &structs.CNIConfig{
+						Args: map[string]string{
+							"static": "example",
+							"second": "bar-opt",
+						},
+					},
+				},
+			},
+			name: "interpolated and non-interpolated cni args",
 		},
 	}
 

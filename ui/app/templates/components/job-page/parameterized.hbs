@@ -1,6 +1,6 @@
 {{!
   Copyright (c) HashiCorp, Inc.
-  SPDX-License-Identifier: MPL-2.0
+  SPDX-License-Identifier: BUSL-1.1
 ~}}
 
 <JobPage @job={{@job}} as |jobPage|>
@@ -17,6 +17,7 @@
       @sortProperty={{@sortProperty}}
       @sortDescending={{@sortDescending}}
       @currentPage={{@currentPage}}
+      @jobs={{@childJobs}}
     />
     <jobPage.ui.Meta />
   </jobPage.ui.Body>

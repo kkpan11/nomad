@@ -1,6 +1,6 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 /* eslint-disable qunit/require-expect */
@@ -21,6 +21,7 @@ module('Acceptance | plugin detail', function (hooks) {
   let plugin;
 
   hooks.beforeEach(function () {
+    server.create('node-pool');
     server.create('node');
     plugin = server.create('csi-plugin', { controllerRequired: true });
   });

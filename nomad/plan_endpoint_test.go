@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package nomad
 
@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	msgpackrpc "github.com/hashicorp/net-rpc-msgpackrpc"
+	msgpackrpc "github.com/hashicorp/net-rpc-msgpackrpc/v2"
 	"github.com/hashicorp/nomad/ci"
 	"github.com/hashicorp/nomad/nomad/mock"
 	"github.com/hashicorp/nomad/nomad/structs"
@@ -25,7 +25,7 @@ func TestPlanEndpoint_Submit(t *testing.T) {
 	})
 	defer cleanupS1()
 	codec := rpcClient(t, s1)
-	testutil.WaitForLeader(t, s1.RPC)
+	testutil.WaitForKeyring(t, s1.RPC, s1.Region())
 
 	// Create the register request
 	eval1 := mock.Eval()
@@ -67,7 +67,7 @@ func TestPlanEndpoint_Submit_Bad(t *testing.T) {
 	})
 	defer cleanupS1()
 	codec := rpcClient(t, s1)
-	testutil.WaitForLeader(t, s1.RPC)
+	testutil.WaitForKeyring(t, s1.RPC, s1.Region())
 
 	// Mock a valid eval being dequeued by a worker
 	eval := mock.Eval()
@@ -135,13 +135,13 @@ func TestPlanEndpoint_Submit_Bad(t *testing.T) {
 }
 
 func TestPlanEndpoint_ApplyConcurrent(t *testing.T) {
-	t.Parallel()
+	ci.Parallel(t)
 
 	s1, cleanupS1 := TestServer(t, func(c *Config) {
 		c.NumSchedulers = 0
 	})
 	defer cleanupS1()
-	testutil.WaitForLeader(t, s1.RPC)
+	testutil.WaitForKeyring(t, s1.RPC, s1.Region())
 
 	plans := []*structs.Plan{}
 

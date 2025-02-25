@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package docker
 
@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hashicorp/nomad/client/lib/cgutil"
+	"github.com/docker/docker/api/types/network"
 	"github.com/hashicorp/nomad/helper/pointer"
 	"github.com/hashicorp/nomad/plugins/drivers"
 	"github.com/hashicorp/nomad/plugins/drivers/utils"
@@ -21,7 +21,6 @@ func (d *Driver) Fingerprint(ctx context.Context) (<-chan *drivers.Fingerprint, 
 	// Start docker reconcilers when we start fingerprinting, a workaround for
 	// task drivers not having a kind of post-setup hook.
 	d.danglingReconciler.Start()
-	d.cpusetFixer.Start()
 
 	ch := make(chan *drivers.Fingerprint)
 	go d.handleFingerprint(ctx, ch)
@@ -90,15 +89,15 @@ func (d *Driver) buildFingerprint() *drivers.Fingerprint {
 		HealthDescription: drivers.DriverHealthy,
 	}
 
-	// disable if cgv2 && non-root
-	if cgutil.UseV2 && !utils.IsUnixRoot() {
-		fp.Health = drivers.HealthStateUndetected
-		fp.HealthDescription = drivers.DriverRequiresRootMessage
-		d.setFingerprintFailure()
-		return fp
+	// warn if non-root on linux systems unless we've intentionally disabled
+	// cpuset management
+	if runtime.GOOS == "linux" && !utils.IsUnixRoot() {
+		d.config.disableCpusetManagement = true
+		d.logger.Warn("docker driver requires running as root: resources.cores and NUMA-aware scheduling will not function correctly on this node, including for non-docker tasks")
+		fp.Attributes["driver.docker.cpuset_management.disabled"] = pstructs.NewBoolAttribute(true)
 	}
 
-	client, _, err := d.dockerClients()
+	dockerClient, err := d.getDockerClient()
 	if err != nil {
 		if d.fingerprintSuccessful() {
 			d.logger.Info("failed to initialize client", "error", err)
@@ -110,10 +109,10 @@ func (d *Driver) buildFingerprint() *drivers.Fingerprint {
 		}
 	}
 
-	env, err := client.Version()
+	env, err := dockerClient.ServerVersion(d.ctx)
 	if err != nil {
 		if d.fingerprintSuccessful() {
-			d.logger.Debug("could not connect to docker daemon", "endpoint", client.Endpoint(), "error", err)
+			d.logger.Debug("could not connect to docker daemon", "endpoint", dockerClient.DaemonHost(), "error", err)
 		}
 		d.setFingerprintFailure()
 
@@ -130,7 +129,7 @@ func (d *Driver) buildFingerprint() *drivers.Fingerprint {
 
 	d.setDetected(true)
 	fp.Attributes["driver.docker"] = pstructs.NewBoolAttribute(true)
-	fp.Attributes["driver.docker.version"] = pstructs.NewStringAttribute(env.Get("Version"))
+	fp.Attributes["driver.docker.version"] = pstructs.NewStringAttribute(env.Version)
 	if d.config.AllowPrivileged {
 		fp.Attributes["driver.docker.privileged.enabled"] = pstructs.NewBoolAttribute(true)
 	}
@@ -143,7 +142,7 @@ func (d *Driver) buildFingerprint() *drivers.Fingerprint {
 		fp.Attributes["driver.docker.volumes.enabled"] = pstructs.NewBoolAttribute(true)
 	}
 
-	if nets, err := client.ListNetworks(); err != nil {
+	if nets, err := dockerClient.NetworkList(d.ctx, network.ListOptions{}); err != nil {
 		d.logger.Warn("error discovering bridge IP", "error", err)
 	} else {
 		for _, n := range nets {
@@ -167,7 +166,7 @@ func (d *Driver) buildFingerprint() *drivers.Fingerprint {
 		}
 	}
 
-	if dockerInfo, err := client.Info(); err != nil {
+	if dockerInfo, err := dockerClient.Info(d.ctx); err != nil {
 		d.logger.Warn("failed to get Docker system info", "error", err)
 	} else {
 		runtimeNames := make([]string, 0, len(dockerInfo.Runtimes))

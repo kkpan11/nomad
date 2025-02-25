@@ -1,11 +1,12 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package taskrunner
 
 import (
 	"context"
 	"encoding/json"
+	"maps"
 	"net"
 	"testing"
 
@@ -17,7 +18,6 @@ import (
 	pstructs "github.com/hashicorp/nomad/plugins/shared/structs"
 	"github.com/shoenig/test/must"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/exp/maps"
 )
 
 // Statically assert the logmon hook implements the expected interfaces

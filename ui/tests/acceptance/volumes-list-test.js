@@ -1,6 +1,6 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 /* eslint-disable qunit/require-expect */
@@ -32,6 +32,7 @@ module('Acceptance | volumes list', function (hooks) {
 
   hooks.beforeEach(function () {
     faker.seed(1);
+    server.create('node-pool');
     server.create('node');
     server.create('csi-plugin', { createVolumes: false });
     window.localStorage.clear();

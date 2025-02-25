@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package mock
 
@@ -87,7 +87,10 @@ func Alloc() *structs.Allocation {
 }
 
 func MinAlloc() *structs.Allocation {
-	job := MinJob()
+	return MinAllocForJob(MinJob())
+}
+
+func MinAllocForJob(job *structs.Job) *structs.Allocation {
 	group := job.TaskGroups[0]
 	task := group.Tasks[0]
 	return &structs.Allocation{
@@ -95,6 +98,8 @@ func MinAlloc() *structs.Allocation {
 		EvalID:        uuid.Generate(),
 		NodeID:        uuid.Generate(),
 		Job:           job,
+		JobID:         job.ID,
+		Namespace:     job.Namespace,
 		TaskGroup:     group.Name,
 		ClientStatus:  structs.AllocClientStatusPending,
 		DesiredStatus: structs.AllocDesiredStatusRun,

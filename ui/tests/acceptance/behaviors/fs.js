@@ -1,6 +1,6 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 /* eslint-disable qunit/require-expect */
@@ -87,12 +87,13 @@ export default function browseFilesystem({
         })}${encodeURIComponent(filePath)}`,
         'No redirect'
       );
-      assert.equal(
-        document.title,
-        `${pathWithLeadingSlash} - ${getTitleComponent({
-          allocation: this.allocation,
-          task: this.task,
-        })} - Mirage - Nomad`
+      assert.ok(
+        document.title.includes(
+          `${pathWithLeadingSlash} - ${getTitleComponent({
+            allocation: this.allocation,
+            task: this.task,
+          })}`
+        )
       );
       assert.equal(
         FS.breadcrumbsText,
@@ -410,7 +411,7 @@ export default function browseFilesystem({
     await visit('/');
 
     this.server.get('/client/fs/stat/:allocation_id', () => {
-      return new Response(999);
+      return new Response(599);
     });
 
     await FS[pageObjectVisitPathFunctionName]({
@@ -443,7 +444,7 @@ export default function browseFilesystem({
     await visit('/');
 
     this.server.get('/client/fs/ls/:allocation_id', () => {
-      return new Response(999);
+      return new Response(599);
     });
 
     await FS[pageObjectVisitPathFunctionName]({

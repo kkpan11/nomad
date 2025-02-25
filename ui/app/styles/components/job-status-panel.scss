@@ -1,7 +1,8 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
+@import '~@hashicorp/design-system-tokens/dist/products/css/helpers/colors.css';
 
 .job-status-panel {
   // #region layout
@@ -24,6 +25,28 @@
     }
   }
 
+  .boxed-section-head h2 .hds-badge {
+    margin-left: 5px;
+    margin-top: -2px;
+  }
+
+  &.active-deployment {
+    & > .boxed-section-head {
+      background: var(--token-color-surface-highlight);
+
+      h2 .hds-badge {
+        background-color: var(--token-color-border-highlight);
+        border-color: var(--token-color-border-highlight);
+        color: var(--token-color-foreground-highlight-high-contrast);
+      }
+    }
+    & > .boxed-section-head,
+    & > .boxed-section-body,
+    & > .boxed-section-foot {
+      border-color: var(--token-color-border-highlight);
+    }
+  }
+
   &.active-deployment .boxed-section-body {
     display: grid;
     grid-template-areas:
@@ -33,6 +56,28 @@
     gap: 1rem;
     grid-auto-columns: 100%;
 
+    &.requires-promotion {
+      grid-template-areas:
+        'promotion-alert'
+        'deployment-allocations'
+        'legend-and-summary'
+        'history-and-params';
+
+      & > .canary-promotion-alert {
+        button {
+          background-color: $orange;
+          border-color: darken($orange, 5%);
+          &:hover {
+            background-color: darken($orange, 5%);
+          }
+        }
+      }
+    }
+
+    & > .promotion-alert {
+      grid-area: promotion-alert;
+    }
+
     & > .deployment-allocations {
       grid-area: deployment-allocations;
       display: grid;
@@ -41,11 +86,53 @@
 
       & > h4 {
         margin-bottom: -0.5rem;
+        display: grid;
+        grid-template-columns: auto 1fr;
+        gap: 0.5rem;
+        margin-top: 1rem;
+
+        & > .versions > ul {
+          grid-template-columns: unset;
+          grid-auto-columns: min-content;
+          grid-auto-flow: column;
+        }
       }
     }
 
     & > .history-and-params {
       grid-area: history-and-params;
+    }
+  }
+
+  .versions {
+    & > ul {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, 65px);
+      gap: 0.5rem;
+      & > li {
+        white-space: nowrap;
+        &:has(.version-count) .version-label {
+          border-top-right-radius: 0;
+          border-bottom-right-radius: 0;
+        }
+      }
+      a {
+        text-decoration: none;
+      }
+    }
+    .version-label {
+      position: relative;
+      z-index: 2;
+      & > .hds-badge__text {
+        font-weight: 700;
+      }
+    }
+    .version-count {
+      color: $blue;
+      position: relative;
+      z-index: 1;
+      left: -1rem;
+      padding-left: 1rem;
     }
   }
 
@@ -67,21 +154,9 @@
 
     legend {
       display: grid;
-      grid-template-columns: repeat(4, 1fr);
+      grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
       gap: 0.5rem;
-    }
-    .versions {
-      & > ul {
-        display: grid;
-        grid-template-columns: repeat(auto-fit, 100px);
-        gap: 0.5rem;
-        & > li {
-          white-space: nowrap;
-          & a {
-            text-decoration: none;
-          }
-        }
-      }
+      grid-template-rows: min-content;
     }
     .latest-deployment {
       h4 svg {
@@ -93,7 +168,7 @@
     .failed-or-lost > div {
       display: grid;
       gap: 3px;
-      .tooltip {
+      & > span > button {
         top: 3px;
       }
     }
@@ -109,7 +184,7 @@
     gap: 0.5rem;
     grid-template-columns: 1fr 1fr;
     padding: 0.25rem 0.5rem;
-    margin-left: 1rem;
+    margin-left: auto;
 
     button {
       height: auto;
@@ -330,20 +405,36 @@
     }
   }
 
-  .legend-item .represented-allocation .flight-icon {
-    animation: none;
+  .allocation-status-row.compact {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    align-items: center;
+    gap: 1rem;
+    max-width: 400px;
+    .alloc-status-summaries {
+      height: 6px;
+      gap: 6px;
+      .represented-allocation {
+        height: 6px;
+        .rest-count {
+          display: none;
+        }
+      }
+    }
   }
 
-  & > .boxed-section-body > .deployment-allocations {
-    margin-bottom: 1rem;
+  .legend-item .represented-allocation .hds-icon {
+    animation: none;
   }
 
   .legend-item {
     display: grid;
     gap: 0.5rem;
     grid-template-columns: auto 1fr;
+    white-space: nowrap;
+    flex: 1 0 auto;
 
-    &.faded {
+    &.faded .count {
       opacity: 0.5;
     }
 
@@ -362,7 +453,12 @@
     display: grid;
     grid-template-columns: 70% auto;
     gap: 1rem;
-    margin-top: 1rem;
+    margin-top: 2rem;
+    & > .deployment-history,
+    & > .update-parameters {
+      display: grid;
+      grid-template-rows: 50px auto;
+    }
   }
 
   &.steady-state .history-and-params {
@@ -413,33 +509,33 @@
         max-width: unset;
       }
     }
-    & > ol {
+    .timeline-container {
       max-height: 300px;
       overflow-y: auto;
-    }
-    & > ol > li {
-      @for $i from 1 through 50 {
-        &:nth-child(#{$i}) {
-          animation-name: historyItemSlide;
-          animation-duration: 0.2s;
-          animation-fill-mode: both;
-          animation-delay: 0.1s + (0.05 * $i);
+      & > ol > li {
+        @for $i from 1 through 50 {
+          &:nth-child(#{$i}) {
+            animation-name: historyItemSlide;
+            animation-duration: 0.2s;
+            animation-fill-mode: both;
+            animation-delay: 0.1s + (0.05 * $i);
+          }
+
+          &:nth-child(#{$i}) > div {
+            animation-name: historyItemShine;
+            animation-duration: 1s;
+            animation-fill-mode: both;
+            animation-delay: 0.1s + (0.05 * $i);
+          }
         }
 
-        &:nth-child(#{$i}) > div {
-          animation-name: historyItemShine;
-          animation-duration: 1s;
-          animation-fill-mode: both;
-          animation-delay: 0.1s + (0.05 * $i);
+        & > div {
+          gap: 0.5rem;
         }
-      }
-
-      & > div {
-        gap: 0.5rem;
-      }
-      &.error > div {
-        border: 1px solid $danger;
-        background: rgba($danger, 0.1);
+        &.error > div {
+          border: 1px solid $danger;
+          background: lighten($danger, 45%);
+        }
       }
     }
   }
@@ -449,6 +545,10 @@
       max-height: 300px;
       overflow-y: auto;
       display: block;
+    }
+    & > .title {
+      display: grid;
+      align-content: center;
     }
     ul,
     span.notification {

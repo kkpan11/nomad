@@ -177,9 +177,14 @@ func TestConsulUpstream_Copy(t *testing.T) {
 		cu := &ConsulUpstream{
 			DestinationName:      "dest1",
 			DestinationNamespace: "ns2",
+			DestinationPeer:      "10.0.0.1:6379",
+			DestinationPartition: "infra",
+			DestinationType:      "tcp",
 			Datacenter:           "dc2",
 			LocalBindPort:        2000,
 			LocalBindAddress:     "10.0.0.1",
+			LocalBindSocketPath:  "/var/run/testsocket.sock",
+			LocalBindSocketMode:  "0666",
 			MeshGateway:          &ConsulMeshGateway{Mode: "remote"},
 			Config:               map[string]any{"connect_timeout_ms": 5000},
 		}
@@ -201,9 +206,13 @@ func TestConsulUpstream_Canonicalize(t *testing.T) {
 		cu := &ConsulUpstream{
 			DestinationName:      "dest1",
 			DestinationNamespace: "ns2",
+			DestinationPeer:      "10.0.0.1:6379",
+			DestinationType:      "tcp",
 			Datacenter:           "dc2",
 			LocalBindPort:        2000,
 			LocalBindAddress:     "10.0.0.1",
+			LocalBindSocketPath:  "/var/run/testsocket.sock",
+			LocalBindSocketMode:  "0666",
 			MeshGateway:          &ConsulMeshGateway{Mode: ""},
 			Config:               make(map[string]any),
 		}
@@ -211,9 +220,13 @@ func TestConsulUpstream_Canonicalize(t *testing.T) {
 		must.Eq(t, &ConsulUpstream{
 			DestinationName:      "dest1",
 			DestinationNamespace: "ns2",
+			DestinationPeer:      "10.0.0.1:6379",
+			DestinationType:      "tcp",
 			Datacenter:           "dc2",
 			LocalBindPort:        2000,
 			LocalBindAddress:     "10.0.0.1",
+			LocalBindSocketPath:  "/var/run/testsocket.sock",
+			LocalBindSocketMode:  "0666",
 			MeshGateway:          &ConsulMeshGateway{Mode: ""},
 			Config:               nil,
 		}, cu)
@@ -250,6 +263,20 @@ func TestSidecarTask_Canonicalize(t *testing.T) {
 		st.Canonicalize()
 		must.Eq(t, exp, st.Resources)
 	})
+
+	t.Run("non empty sidecar_task volume_mount", func(t *testing.T) {
+		st := &SidecarTask{
+			VolumeMounts: []*VolumeMount{{
+				Volume:      pointerOf("vol0"),
+				Destination: pointerOf("/local/foo"),
+			}},
+		}
+		st.Canonicalize()
+		must.Eq(t, pointerOf(false), st.VolumeMounts[0].ReadOnly)
+		must.Eq(t, pointerOf("private"), st.VolumeMounts[0].PropagationMode)
+		must.Eq(t, pointerOf(""), st.VolumeMounts[0].SELinuxLabel)
+	})
+
 }
 
 func TestConsulGateway_Canonicalize(t *testing.T) {
@@ -403,6 +430,33 @@ func TestConsulIngressConfigEntry_Copy(t *testing.T) {
 			Services: []*ConsulIngressService{{
 				Name:  "service1",
 				Hosts: []string{"1.1.1.1", "1.1.1.1:9000"},
+				TLS: &ConsulGatewayTLSConfig{
+					SDS: &ConsulGatewayTLSSDSConfig{
+						ClusterName:  "foo",
+						CertResource: "bar",
+					},
+				},
+				RequestHeaders: &ConsulHTTPHeaderModifiers{
+					Add: map[string]string{
+						"test": "testvalue",
+					},
+					Set: map[string]string{
+						"test1": "testvalue1",
+					},
+					Remove: []string{"test2"},
+				},
+				ResponseHeaders: &ConsulHTTPHeaderModifiers{
+					Add: map[string]string{
+						"test": "testvalue",
+					},
+					Set: map[string]string{
+						"test1": "testvalue1",
+					},
+					Remove: []string{"test2"},
+				},
+				MaxConnections:        pointerOf(uint32(5120)),
+				MaxPendingRequests:    pointerOf(uint32(512)),
+				MaxConcurrentRequests: pointerOf(uint32(2048)),
 			}, {
 				Name:  "service2",
 				Hosts: []string{"2.2.2.2"},

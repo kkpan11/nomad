@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package taskenv
 
@@ -43,6 +43,7 @@ func TestInterpolateServices(t *testing.T) {
 					Protocol:      "${checkproto}",
 					PortLabel:     "${checklabel}",
 					InitialStatus: "${checkstatus}",
+					Notes:         "${checknotes}",
 					Method:        "${checkmethod}",
 					Header: map[string][]string{
 						"${checkheaderk}": {"${checkheaderv}"},
@@ -71,6 +72,7 @@ func TestInterpolateServices(t *testing.T) {
 			"checkproto":   "checkproto",
 			"checklabel":   "checklabel",
 			"checkstatus":  "checkstatus",
+			"checknotes":   "checknotes",
 			"checkmethod":  "checkmethod",
 			"checkheaderk": "checkheaderk",
 			"checkheaderv": "checkheaderv",
@@ -104,6 +106,7 @@ func TestInterpolateServices(t *testing.T) {
 					Protocol:      "checkproto",
 					PortLabel:     "checklabel",
 					InitialStatus: "checkstatus",
+					Notes:         "checknotes",
 					Method:        "checkmethod",
 					Header: map[string][]string{
 						"checkheaderk": {"checkheaderv"},

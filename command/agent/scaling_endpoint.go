@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package agent
 
@@ -13,7 +13,7 @@ import (
 
 func (s *HTTPServer) ScalingPoliciesRequest(resp http.ResponseWriter, req *http.Request) (interface{}, error) {
 	switch req.Method {
-	case "GET":
+	case http.MethodGet:
 		return s.scalingPoliciesListRequest(resp, req)
 	default:
 		return nil, CodedError(405, ErrInvalidMethod)
@@ -52,7 +52,7 @@ func (s *HTTPServer) ScalingPolicySpecificRequest(resp http.ResponseWriter, req 
 func (s *HTTPServer) scalingPolicyCRUD(resp http.ResponseWriter, req *http.Request,
 	policyID string) (interface{}, error) {
 	switch req.Method {
-	case "GET":
+	case http.MethodGet:
 		return s.scalingPolicyQuery(resp, req, policyID)
 	default:
 		return nil, CodedError(405, ErrInvalidMethod)
@@ -81,7 +81,7 @@ func (s *HTTPServer) scalingPolicyQuery(resp http.ResponseWriter, req *http.Requ
 	return out.Policy, nil
 }
 
-func ApiScalingPolicyToStructs(count int, ap *api.ScalingPolicy) *structs.ScalingPolicy {
+func ApiScalingPolicyToStructs(job *structs.Job, tg *structs.TaskGroup, task *structs.Task, count int, ap *api.ScalingPolicy) *structs.ScalingPolicy {
 	p := structs.ScalingPolicy{
 		Type:   ap.Type,
 		Policy: ap.Policy,
@@ -103,5 +103,9 @@ func ApiScalingPolicyToStructs(count int, ap *api.ScalingPolicy) *structs.Scalin
 	} else {
 		p.Min = int64(count)
 	}
+
+	// COMPAT(1.12.0) - canonicalization is done in Job.Register as of 1.9,
+	// remove this canonicalization in 1.12.0 LTS
+	p.Canonicalize(job, tg, task)
 	return &p
 }

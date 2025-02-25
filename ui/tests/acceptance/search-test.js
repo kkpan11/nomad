@@ -1,6 +1,6 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 /* eslint-disable ember-a11y-testing/a11y-audit-called */
@@ -19,6 +19,7 @@ module('Acceptance | search', function (hooks) {
   setupMirage(hooks);
 
   test('search exposes and navigates to results from the fuzzy search endpoint', async function (assert) {
+    server.create('node-pool');
     server.create('node', { name: 'xyz' });
     const otherNode = server.create('node', { name: 'ghi' });
 
@@ -29,27 +30,27 @@ module('Acceptance | search', function (hooks) {
       id: 'vwxyz',
       namespaceId: 'default',
       groupsCount: 1,
-      groupTaskCount: 1,
+      groupAllocCount: 1,
     });
     server.create('job', {
       id: 'xyz',
       name: 'xyz job',
       namespaceId: 'default',
       groupsCount: 1,
-      groupTaskCount: 1,
+      groupAllocCount: 1,
     });
     server.create('job', {
       id: 'xyzw',
       name: 'xyzw job',
       namespaceId: 'dev',
       groupsCount: 1,
-      groupTaskCount: 1,
+      groupAllocCount: 1,
     });
     server.create('job', {
       id: 'abc',
       namespaceId: 'default',
       groupsCount: 1,
-      groupTaskCount: 1,
+      groupAllocCount: 1,
     });
 
     const firstAllocation = server.schema.allocations.all().models[0];
@@ -184,6 +185,7 @@ module('Acceptance | search', function (hooks) {
   });
 
   test('results are truncated at 10 per group', async function (assert) {
+    server.create('node-pool');
     server.create('node', { name: 'xyz' });
 
     for (let i = 0; i < 11; i++) {
@@ -203,6 +205,7 @@ module('Acceptance | search', function (hooks) {
   });
 
   test('server-side truncation is indicated in the group label', async function (assert) {
+    server.create('node-pool');
     server.create('node', { name: 'xyz' });
 
     for (let i = 0; i < 21; i++) {
@@ -241,6 +244,7 @@ module('Acceptance | search', function (hooks) {
   });
 
   test('pressing slash when an input element is focused does not start a search', async function (assert) {
+    server.create('node-pool');
     server.create('node');
     server.create('job');
 

@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package command
 
@@ -8,7 +8,6 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/hashicorp/nomad/api"
 	"github.com/posener/complete"
 )
 
@@ -89,7 +88,7 @@ func (c *NodePoolInfoCommand) Run(args []string) int {
 		return 1
 	}
 
-	pool, possible, err := c.nodePoolByPrefix(client, args[0])
+	pool, possible, err := nodePoolByPrefix(client, args[0])
 	if err != nil {
 		c.Ui.Error(fmt.Sprintf("Error retrieving node pool: %s", err))
 		return 1
@@ -131,37 +130,19 @@ func (c *NodePoolInfoCommand) Run(args []string) int {
 	}
 
 	c.Ui.Output(c.Colorize().Color("\n[bold]Scheduler Configuration[reset]"))
-	if pool.SchedulerConfiguration != nil {
-		schedConfig := []string{
-			fmt.Sprintf("Scheduler Algorithm|%s", pool.SchedulerConfiguration.SchedulerAlgorithm),
+	if schedConfig := pool.SchedulerConfiguration; schedConfig != nil {
+		schedConfigOut := []string{
+			fmt.Sprintf("Scheduler Algorithm|%s", schedConfig.SchedulerAlgorithm),
 		}
-		c.Ui.Output(formatKV(schedConfig))
+		if schedConfig.MemoryOversubscriptionEnabled != nil {
+			schedConfigOut = append(schedConfigOut,
+				fmt.Sprintf("Memory Oversubscription Enabled|%v", *schedConfig.MemoryOversubscriptionEnabled),
+			)
+		}
+		c.Ui.Output(formatKV(schedConfigOut))
 	} else {
 		c.Ui.Output("No scheduler configuration")
 	}
 
 	return 0
-}
-
-// nodePoolByPrefix returns a node pool that matches the given prefix or a list
-// of all matches if an exact match is not found.
-func (c *NodePoolInfoCommand) nodePoolByPrefix(client *api.Client, prefix string) (*api.NodePool, []*api.NodePool, error) {
-	pools, _, err := client.NodePools().PrefixList(prefix, nil)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	switch len(pools) {
-	case 0:
-		return nil, nil, fmt.Errorf("No node pool with prefix %q found", prefix)
-	case 1:
-		return pools[0], nil, nil
-	default:
-		for _, pool := range pools {
-			if pool.Name == prefix {
-				return pool, nil, nil
-			}
-		}
-		return nil, pools, nil
-	}
 }

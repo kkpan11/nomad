@@ -1,6 +1,6 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 /* eslint-disable qunit/require-expect */
@@ -19,6 +19,7 @@ module('Acceptance | job evaluations', function (hooks) {
   setupMirage(hooks);
 
   hooks.beforeEach(async function () {
+    server.create('node-pool');
     job = server.create('job', {
       noFailedPlacements: true,
       createAllocations: false,

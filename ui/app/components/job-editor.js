@@ -1,6 +1,6 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 // @ts-check
@@ -11,6 +11,7 @@ import { task } from 'ember-concurrency';
 import messageFromAdapterError from 'nomad-ui/utils/message-from-adapter-error';
 import localStorageProperty from 'nomad-ui/utils/properties/local-storage';
 import { tracked } from '@glimmer/tracking';
+import jsonToHcl from 'nomad-ui/utils/json-to-hcl';
 
 /**
  * JobEditor component that provides an interface for editing and managing Nomad jobs.
@@ -21,6 +22,7 @@ import { tracked } from '@glimmer/tracking';
 export default class JobEditor extends Component {
   @service config;
   @service store;
+  @service notifications;
 
   @tracked error = null;
   @tracked planOutput = null;
@@ -38,9 +40,7 @@ export default class JobEditor extends Component {
     if (this.args.variables) {
       this.args.job.set(
         '_newDefinitionVariables',
-        this.jsonToHcl(this.args.variables.flags).concat(
-          this.args.variables.literal
-        )
+        jsonToHcl(this.args.variables.flags).concat(this.args.variables.literal)
       );
     }
   }
@@ -85,6 +85,7 @@ export default class JobEditor extends Component {
   }
 
   @localStorageProperty('nomadMessageJobPlan', true) shouldShowPlanMessage;
+  @localStorageProperty('nomadShouldWrapCode', false) shouldWrapCode;
 
   @action
   dismissPlanMessage() {
@@ -184,6 +185,14 @@ export default class JobEditor extends Component {
   }
 
   /**
+   * Toggle the wrapping of the job's definition or definition variables.
+   */
+  @action
+  toggleWrap() {
+    this.shouldWrapCode = !this.shouldWrapCode;
+  }
+
+  /**
    * Read the content of an uploaded job specification file and update the job's definition.
    *
    * @param {Event} event - The input change event containing the selected file.
@@ -200,6 +209,42 @@ export default class JobEditor extends Component {
   }
 
   /**
+   * Download the job's definition or specification as .nomad.hcl file locally
+   */
+  @action
+  async handleSaveAsFile() {
+    try {
+      const blob = new Blob([this.args.job._newDefinition], {
+        type: 'text/plain',
+      });
+      const url = window.URL.createObjectURL(blob);
+      const downloadAnchor = document.createElement('a');
+
+      downloadAnchor.href = url;
+      downloadAnchor.target = '_blank';
+      downloadAnchor.rel = 'noopener noreferrer';
+      downloadAnchor.download = 'jobspec.nomad.hcl';
+
+      downloadAnchor.click();
+      downloadAnchor.remove();
+
+      window.URL.revokeObjectURL(url);
+      this.notifications.add({
+        title: 'jobspec.nomad.hcl has been downloaded',
+        color: 'success',
+        icon: 'download',
+      });
+    } catch (err) {
+      this.notifications.add({
+        title: 'Error downloading file',
+        message: err.message,
+        color: 'critical',
+        sticky: true,
+      });
+    }
+  }
+
+  /**
    * Get the definition or specification based on the view type.
    *
    * @returns {string} The definition or specification in JSON or HCL format.
@@ -210,24 +255,6 @@ export default class JobEditor extends Component {
     } else {
       return this.args.specification;
     }
-  }
-
-  /**
-   * Convert a JSON object to an HCL string.
-   *
-   * @param {Object} obj - The JSON object to convert.
-   * @returns {string} The HCL string representation of the JSON object.
-   */
-  jsonToHcl(obj) {
-    const hclLines = [];
-
-    for (const key in obj) {
-      const value = obj[key];
-      const hclValue = typeof value === 'string' ? `"${value}"` : value;
-      hclLines.push(`${key}=${hclValue}\n`);
-    }
-
-    return hclLines.join('\n');
   }
 
   get data() {
@@ -242,6 +269,7 @@ export default class JobEditor extends Component {
       planOutput: this.planOutput,
       shouldShowPlanMessage: this.shouldShowPlanMessage,
       view: this.args.view,
+      shouldWrap: this.shouldWrapCode,
     };
   }
 
@@ -253,10 +281,12 @@ export default class JobEditor extends Component {
       onPlan: this.plan,
       onReset: this.reset,
       onSaveAs: this.args.handleSaveAsTemplate,
+      onSaveFile: this.handleSaveAsFile,
       onSubmit: this.submit,
       onSelect: this.args.onSelect,
       onUpdate: this.updateCode,
       onUpload: this.uploadJobSpec,
+      onToggleWrap: this.toggleWrap,
     };
   }
 }

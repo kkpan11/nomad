@@ -1,6 +1,6 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 import {
@@ -53,6 +53,8 @@ export default create({
     source: text('[data-test-volume-source]'),
     permissions: text('[data-test-volume-permissions]'),
   }),
+
+  hasMeta: isPresent('[data-test-meta]'),
 
   hasScaleEvents: isPresent('[data-test-scale-events]'),
   scaleEvents: collection(

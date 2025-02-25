@@ -1,6 +1,6 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 import { inject as service } from '@ember/service';
@@ -44,7 +44,9 @@ export default class ApplicationAdapter extends RESTAdapter {
     return super.findAll(...arguments).catch((error) => {
       const errorCodes = codesForError(error);
 
-      const isNotImplemented = errorCodes.includes('501');
+      const isNotImplemented =
+        errorCodes.includes('501') ||
+        error.message.includes("rpc: can't find service");
 
       if (isNotImplemented) {
         return [];
@@ -57,11 +59,11 @@ export default class ApplicationAdapter extends RESTAdapter {
 
   ajaxOptions(url, verb, options = {}) {
     options.data || (options.data = {});
-    if (this.get('system.shouldIncludeRegion')) {
+    if (options.regionOverride || this.get('system.shouldIncludeRegion')) {
       // Region should only ever be a query param. The default ajaxOptions
       // behavior is to include data attributes in the requestBody for PUT
       // and POST requests. This works around that.
-      const region = this.get('system.activeRegion');
+      const region = options.regionOverride || this.get('system.activeRegion');
       if (region) {
         url = associateRegion(url, region);
       }

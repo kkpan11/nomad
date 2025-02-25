@@ -1,6 +1,6 @@
 {{!
   Copyright (c) HashiCorp, Inc.
-  SPDX-License-Identifier: MPL-2.0
+  SPDX-License-Identifier: BUSL-1.1
 ~}}
 
 {{page-title "Evaluations"}}
@@ -86,7 +86,7 @@
             <td data-test-id
                 {{keyboard-shortcut 
                   enumerated=true
-                  action=(fn this.handleEvaluationClick row.model)
+                  action=(fn this.handleEvaluationClick row.model "keynav")
                 }}
             >
               {{row.model.shortId}}

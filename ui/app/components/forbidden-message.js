@@ -1,6 +1,6 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 import Component from '@ember/component';
@@ -11,6 +11,7 @@ import { inject as service } from '@ember/service';
 export default class ForbiddenMessage extends Component {
   @service token;
   @service store;
+  @service router;
 
   get authMethods() {
     return this.store.findAll('auth-method');

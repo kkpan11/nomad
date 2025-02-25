@@ -1,9 +1,10 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package state
 
 import (
+	"errors"
 	"fmt"
 
 	arstate "github.com/hashicorp/nomad/client/allocrunner/state"
@@ -12,8 +13,13 @@ import (
 	"github.com/hashicorp/nomad/client/dynamicplugins"
 	driverstate "github.com/hashicorp/nomad/client/pluginmanager/drivermanager/state"
 	"github.com/hashicorp/nomad/client/serviceregistration/checks"
+	cstructs "github.com/hashicorp/nomad/client/structs"
 	"github.com/hashicorp/nomad/nomad/structs"
 )
+
+var _ StateDB = &ErrDB{}
+
+var ErrDBError = errors.New("Error!")
 
 // ErrDB implements a StateDB that returns errors on restore methods, used for testing
 type ErrDB struct {
@@ -58,6 +64,22 @@ func (m *ErrDB) PutAcknowledgedState(allocID string, state *arstate.State, opts 
 }
 
 func (m *ErrDB) GetAcknowledgedState(allocID string) (*arstate.State, error) {
+	return nil, fmt.Errorf("Error!")
+}
+
+func (m *ErrDB) PutAllocVolumes(allocID string, state *arstate.AllocVolumes, opts ...WriteOption) error {
+	return fmt.Errorf("Error!")
+}
+
+func (m *ErrDB) GetAllocVolumes(allocID string) (*arstate.AllocVolumes, error) {
+	return nil, fmt.Errorf("Error!")
+}
+
+func (m *ErrDB) PutAllocIdentities(_ string, _ []*structs.SignedWorkloadIdentity, _ ...WriteOption) error {
+	return fmt.Errorf("Error!")
+}
+
+func (m *ErrDB) GetAllocIdentities(_ string) ([]*structs.SignedWorkloadIdentity, error) {
 	return nil, fmt.Errorf("Error!")
 }
 
@@ -127,6 +149,24 @@ func (m *ErrDB) PutNodeMeta(map[string]*string) error {
 
 func (m *ErrDB) GetNodeMeta() (map[string]*string, error) {
 	return nil, fmt.Errorf("Error!")
+}
+
+func (m *ErrDB) PutNodeRegistration(reg *cstructs.NodeRegistration) error {
+	return fmt.Errorf("Error!")
+}
+
+func (m *ErrDB) GetNodeRegistration() (*cstructs.NodeRegistration, error) {
+	return nil, fmt.Errorf("Error!")
+}
+
+func (m *ErrDB) PutDynamicHostVolume(_ *cstructs.HostVolumeState) error {
+	return ErrDBError
+}
+func (m *ErrDB) GetDynamicHostVolumes() ([]*cstructs.HostVolumeState, error) {
+	return nil, ErrDBError
+}
+func (m *ErrDB) DeleteDynamicHostVolume(_ string) error {
+	return ErrDBError
 }
 
 func (m *ErrDB) Close() error {

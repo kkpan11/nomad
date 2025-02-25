@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package fingerprint
 
@@ -97,7 +97,7 @@ func (f *EnvGCEFingerprint) Get(attribute string, recursive bool) (string, error
 	}
 
 	req := &http.Request{
-		Method: "GET",
+		Method: http.MethodGet,
 		URL:    parsedUrl,
 		Header: http.Header{
 			"Metadata-Flavor": []string{"Google"},
@@ -121,7 +121,7 @@ func (f *EnvGCEFingerprint) Get(attribute string, recursive bool) (string, error
 		return "", err
 	}
 
-	if res.StatusCode >= 400 {
+	if res.StatusCode >= http.StatusBadRequest {
 		return "", ReqError{res.StatusCode}
 	}
 
@@ -160,6 +160,7 @@ func (f *EnvGCEFingerprint) Fingerprint(req *FingerprintRequest, resp *Fingerpri
 		"cpu-platform":                   false,
 		"scheduling/automatic-restart":   false,
 		"scheduling/on-host-maintenance": false,
+		"scheduling/preemptible":         false,
 	}
 
 	for k, unique := range keys {
@@ -280,7 +281,7 @@ func (f *EnvGCEFingerprint) isGCE() bool {
 	// Query the metadata url for the machine type, to verify we're on GCE
 	machineType, err := f.Get("machine-type", false)
 	if err != nil {
-		if re, ok := err.(ReqError); !ok || re.StatusCode != 404 {
+		if re, ok := err.(ReqError); !ok || re.StatusCode != http.StatusNotFound {
 			// If it wasn't a 404 error, print an error message.
 			f.logger.Debug("error querying GCE Metadata URL, skipping")
 		}

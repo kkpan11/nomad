@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package mock
 
@@ -17,6 +17,7 @@ func Job() *structs.Job {
 		ID:          fmt.Sprintf("mock-service-%s", uuid.Generate()),
 		Name:        "my-job",
 		Namespace:   structs.DefaultNamespace,
+		NodePool:    structs.NodePoolDefault,
 		Type:        structs.JobTypeService,
 		Priority:    structs.JobDefaultPriority,
 		AllAtOnce:   false,
@@ -30,12 +31,13 @@ func Job() *structs.Job {
 		},
 		TaskGroups: []*structs.TaskGroup{
 			{
-				Name:  "web",
-				Count: 10,
+				Name:                    "web",
+				Count:                   10,
+				PreventRescheduleOnLost: false,
 				Constraints: []*structs.Constraint{
 					{
 						LTarget: "${attr.consul.version}",
-						RTarget: ">= 1.7.0",
+						RTarget: ">= 1.8.0",
 						Operand: structs.ConstraintSemver,
 					},
 				},
@@ -43,10 +45,11 @@ func Job() *structs.Job {
 					SizeMB: 150,
 				},
 				RestartPolicy: &structs.RestartPolicy{
-					Attempts: 3,
-					Interval: 10 * time.Minute,
-					Delay:    1 * time.Minute,
-					Mode:     structs.RestartPolicyModeDelay,
+					Attempts:        3,
+					Interval:        10 * time.Minute,
+					Delay:           1 * time.Minute,
+					Mode:            structs.RestartPolicyModeDelay,
+					RenderTemplates: false,
 				},
 				ReschedulePolicy: &structs.ReschedulePolicy{
 					Attempts:      2,
@@ -74,6 +77,25 @@ func Job() *structs.Job {
 						Env: map[string]string{
 							"FOO": "bar",
 						},
+						Actions: []*structs.Action{
+							{
+								Name:    "date-test",
+								Command: "/bin/date",
+								Args:    []string{"-u"},
+							},
+							{
+								Name:    "echo-test",
+								Command: "/bin/echo",
+								Args:    []string{"hello world"},
+							},
+						},
+						Constraints: []*structs.Constraint{
+							{
+								LTarget: "${attr.consul.version}",
+								RTarget: ">= 1.8.0",
+								Operand: structs.ConstraintSemver,
+							},
+						},
 						Services: []*structs.Service{
 							{
 								Name:      "${TASK}-frontend",
@@ -89,10 +111,12 @@ func Job() *structs.Job {
 										Timeout:  5 * time.Second,
 									},
 								},
+								Cluster: "default",
 							},
 							{
 								Name:      "${TASK}-admin",
 								PortLabel: "admin",
+								Cluster:   "default",
 							},
 						},
 						LogConfig: structs.DefaultLogConfig(),
@@ -120,6 +144,7 @@ func Job() *structs.Job {
 		CreateIndex:    42,
 		ModifyIndex:    99,
 		JobModifyIndex: 99,
+		SubmitTime:     time.Now().UTC().Add(-6 * time.Hour).UnixNano(),
 	}
 	job.Canonicalize()
 	return job
@@ -165,7 +190,7 @@ func JobWithScalingPolicy() (*structs.Job, *structs.ScalingPolicy) {
 		Policy:  map[string]interface{}{},
 		Enabled: true,
 	}
-	policy.TargetTaskGroup(job, job.TaskGroups[0])
+	policy.Canonicalize(job, job.TaskGroups[0], nil)
 	job.TaskGroups[0].Scaling = policy
 	return job, policy
 }
@@ -225,10 +250,12 @@ func MultiTaskGroupJob() *structs.Job {
 								Timeout:  5 * time.Second,
 							},
 						},
+						Cluster: "default",
 					},
 					{
 						Name:      "${TASK}-admin",
 						PortLabel: "admin",
+						Cluster:   "default",
 					},
 				},
 				LogConfig: structs.DefaultLogConfig(),
@@ -258,6 +285,7 @@ func SystemBatchJob() *structs.Job {
 		ID:          fmt.Sprintf("mock-sysbatch-%s", uuid.Short()),
 		Name:        "my-sysbatch",
 		Namespace:   structs.DefaultNamespace,
+		NodePool:    structs.NodePoolDefault,
 		Type:        structs.JobTypeSysBatch,
 		Priority:    10,
 		Datacenters: []string{"dc1"},
@@ -320,12 +348,33 @@ func MultiregionJob() *structs.Job {
 	return job
 }
 
+func MultiregionMinJob() *structs.Job {
+	job := MinJob()
+	update := *structs.DefaultUpdateStrategy
+	job.Update = update
+	job.TaskGroups[0].Update = &update
+	job.Multiregion = &structs.Multiregion{
+		Regions: []*structs.MultiregionRegion{
+			{
+				Name:  "west",
+				Count: 1,
+			},
+			{
+				Name:  "east",
+				Count: 1,
+			},
+		},
+	}
+	return job
+}
+
 func BatchJob() *structs.Job {
 	job := &structs.Job{
 		Region:      "global",
 		ID:          fmt.Sprintf("mock-batch-%s", uuid.Generate()),
 		Name:        "batch-job",
 		Namespace:   structs.DefaultNamespace,
+		NodePool:    structs.NodePoolDefault,
 		Type:        structs.JobTypeBatch,
 		Priority:    structs.JobDefaultPriority,
 		AllAtOnce:   false,
@@ -390,6 +439,7 @@ func SystemJob() *structs.Job {
 	job := &structs.Job{
 		Region:      "global",
 		Namespace:   structs.DefaultNamespace,
+		NodePool:    structs.NodePoolDefault,
 		ID:          fmt.Sprintf("mock-system-%s", uuid.Generate()),
 		Name:        "my-job",
 		Type:        structs.JobTypeSystem,
@@ -469,6 +519,7 @@ func MaxParallelJob() *structs.Job {
 		ID:          fmt.Sprintf("mock-service-%s", uuid.Generate()),
 		Name:        "my-job",
 		Namespace:   structs.DefaultNamespace,
+		NodePool:    structs.NodePoolDefault,
 		Type:        structs.JobTypeService,
 		Priority:    structs.JobDefaultPriority,
 		AllAtOnce:   false,
@@ -527,10 +578,12 @@ func MaxParallelJob() *structs.Job {
 										Timeout:  5 * time.Second,
 									},
 								},
+								Cluster: "default",
 							},
 							{
 								Name:      "${TASK}-admin",
 								PortLabel: "admin",
+								Cluster:   "default",
 							},
 						},
 						LogConfig: structs.DefaultLogConfig(),
@@ -659,5 +712,40 @@ func BigBenchmarkJob() *structs.Job {
 		Weight:  50,
 	}}
 
+	return job
+}
+
+// ActionsJob produces a multi-group, multi-task job with actions for testing.
+func ActionsJob() *structs.Job {
+	job := MinJob()
+
+	for i := 0; i < 2; i++ {
+		tg := job.TaskGroups[0].Copy()
+		tg.Name = fmt.Sprintf("g%d", i+1)
+		job.TaskGroups = append(job.TaskGroups, tg)
+	}
+
+	for i := 0; i < 2; i++ {
+		task := job.TaskGroups[0].Tasks[0].Copy()
+		task.Name = fmt.Sprintf("t%d", i+1)
+		job.TaskGroups[0].Tasks = append(job.TaskGroups[0].Tasks, task)
+	}
+
+	for _, tg := range job.TaskGroups {
+		for _, task := range tg.Tasks {
+			task.Actions = []*structs.Action{
+				{
+					Name:    "date-test",
+					Command: "/bin/date",
+					Args:    []string{"-u"},
+				},
+				{
+					Name:    "echo-test",
+					Command: "/bin/echo",
+					Args:    []string{"hello world"},
+				},
+			}
+		}
+	}
 	return job
 }

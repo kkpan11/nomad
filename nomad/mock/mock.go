@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package mock
 
@@ -184,6 +184,8 @@ func Deployment() *structs.Deployment {
 		StatusDescription: structs.DeploymentStatusDescriptionRunning,
 		ModifyIndex:       23,
 		CreateIndex:       21,
+		CreateTime:        time.Now().UTC().UnixNano(),
+		ModifyTime:        time.Now().UTC().UnixNano(),
 	}
 }
 
@@ -247,19 +249,19 @@ func Namespace() *structs.Namespace {
 		CreateIndex: 100,
 		ModifyIndex: 200,
 	}
+	ns.Canonicalize()
 	ns.SetHash()
 	return ns
 }
 
 func NodePool() *structs.NodePool {
-	return &structs.NodePool{
+	pool := &structs.NodePool{
 		Name:        fmt.Sprintf("pool-%s", uuid.Short()),
 		Description: "test node pool",
 		Meta:        map[string]string{"team": "test"},
-		SchedulerConfiguration: &structs.NodePoolSchedulerConfiguration{
-			SchedulerAlgorithm: structs.SchedulerAlgorithmSpread,
-		},
 	}
+	pool.SetHash()
+	return pool
 }
 
 // ServiceRegistrations generates an array containing two unique service

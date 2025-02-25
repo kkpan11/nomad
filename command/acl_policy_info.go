@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package command
 
@@ -16,7 +16,7 @@ type ACLPolicyInfoCommand struct {
 
 func (c *ACLPolicyInfoCommand) Help() string {
 	helpText := `
-Usage: nomad acl policy info <name>
+Usage: nomad acl policy info [options] <name>
 
   Info is used to fetch information on an existing ACL policy.
 

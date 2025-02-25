@@ -1,13 +1,13 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package command
 
 import (
 	"testing"
 
+	"github.com/hashicorp/cli"
 	"github.com/hashicorp/nomad/ci"
-	"github.com/mitchellh/cli"
 	"github.com/shoenig/test/must"
 )
 
@@ -42,4 +42,13 @@ func TestMonitorCommand_Fails(t *testing.T) {
 
 	out = ui.ErrorWriter.String()
 	must.StrContains(t, out, "No node(s) with prefix")
+
+	ui.ErrorWriter.Reset()
+
+	// Fails on passing a log-include-location flag which cannot be parsed.
+	code = cmd.Run([]string{"-address=" + url, "-log-include-location=maybe"})
+	must.One(t, code)
+
+	out = ui.ErrorWriter.String()
+	must.StrContains(t, out, `invalid boolean value "maybe" for -log-include-location`)
 }

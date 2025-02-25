@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package command
 
@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/hashicorp/go-set"
+	"github.com/hashicorp/go-set/v3"
 	"github.com/hashicorp/nomad/api"
 	"github.com/posener/complete"
 )
@@ -32,6 +32,10 @@ Usage: nomad node pool delete [options] <node-pool>
 
   If ACLs are enabled, this command requires a token with the 'delete'
   capability in a 'node_pool' policy that matches the node pool being targeted.
+
+  You cannot delete a node pool that has nodes or non-terminal jobs. In
+  federated clusters, you cannot delete a node pool that has nodes or
+  non-terminal jobs in any of the federated regions.
 
 General Options:
 

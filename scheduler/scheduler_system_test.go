@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package scheduler
 
@@ -83,6 +83,9 @@ func TestSystemSched_JobRegister(t *testing.T) {
 	count, ok := out[0].Metrics.NodesAvailable["dc1"]
 	require.True(t, ok)
 	require.Equal(t, 10, count, "bad metrics %#v:", out[0].Metrics)
+
+	must.Eq(t, 10, out[0].Metrics.NodesInPool,
+		must.Sprint("expected NodesInPool metric to be set"))
 
 	// Ensure no allocations are queued
 	queued := h.Evals[0].QueuedAllocations["web"]
@@ -256,7 +259,7 @@ func TestSystemSched_ExhaustResources(t *testing.T) {
 	// Create a service job which consumes most of the system resources
 	svcJob := mock.Job()
 	svcJob.TaskGroups[0].Count = 1
-	svcJob.TaskGroups[0].Tasks[0].Resources.CPU = 3600
+	svcJob.TaskGroups[0].Tasks[0].Resources.CPU = 13500 // mock.Node() has 14k
 	require.NoError(t, h.State.UpsertJob(structs.MsgTypeTestSetup, h.NextIndex(), nil, svcJob))
 
 	// Create a mock evaluation to register the job
@@ -391,6 +394,8 @@ func TestSystemSched_JobRegister_Annotate(t *testing.T) {
 	if count, ok := out[0].Metrics.NodesAvailable["dc1"]; !ok || count != 10 {
 		t.Fatalf("bad: %#v", out[0].Metrics)
 	}
+	must.Eq(t, 10, out[0].Metrics.NodesInPool,
+		must.Sprint("expected NodesInPool metric to be set"))
 
 	h.AssertEvalStatus(t, structs.EvalStatusComplete)
 
@@ -814,8 +819,6 @@ func TestSystemSched_JobModify_RemoveDC(t *testing.T) {
 	node2.Datacenter = "dc2"
 	require.NoError(t, h.State.UpsertNode(structs.MsgTypeTestSetup, h.NextIndex(), node2))
 
-	fmt.Println("DC1 node: ", node1.ID)
-	fmt.Println("DC2 node: ", node2.ID)
 	nodes := []*structs.Node{node1, node2}
 
 	// Generate a fake job with allocations
@@ -1852,6 +1855,8 @@ func TestSystemSched_Preemption(t *testing.T) {
 
 	h := NewHarness(t)
 
+	legacyCpuResources, processorResources := cpuResources(3072)
+
 	// Create nodes
 	nodes := make([]*structs.Node, 0)
 	for i := 0; i < 2; i++ {
@@ -1868,9 +1873,10 @@ func TestSystemSched_Preemption(t *testing.T) {
 			}},
 		}
 		node.NodeResources = &structs.NodeResources{
-			Cpu:    structs.NodeCpuResources{CpuShares: 3072},
-			Memory: structs.NodeMemoryResources{MemoryMB: 5034},
-			Disk:   structs.NodeDiskResources{DiskMB: 20 * 1024},
+			Processors: processorResources,
+			Cpu:        legacyCpuResources,
+			Memory:     structs.NodeMemoryResources{MemoryMB: 5034},
+			Disk:       structs.NodeDiskResources{DiskMB: 20 * 1024},
 			Networks: []*structs.NetworkResource{{
 				Device: "eth0",
 				CIDR:   "192.168.0.100/32",

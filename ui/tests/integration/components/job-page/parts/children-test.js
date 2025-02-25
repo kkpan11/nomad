@@ -1,6 +1,6 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 import { assign } from '@ember/polyfills';
@@ -19,6 +19,7 @@ module('Integration | Component | job-page/parts/children', function (hooks) {
     this.store = this.owner.lookup('service:store');
     this.server = startMirage();
     this.server.create('namespace');
+    this.server.create('node-pool');
   });
 
   hooks.afterEach(function () {
@@ -26,13 +27,14 @@ module('Integration | Component | job-page/parts/children', function (hooks) {
     window.localStorage.clear();
   });
 
-  const props = (job, options = {}) =>
+  const props = (job, children, options = {}) =>
     assign(
       {
         job,
         sortProperty: 'name',
         sortDescending: true,
         currentPage: 1,
+        children,
       },
       options
     );
@@ -47,8 +49,9 @@ module('Integration | Component | job-page/parts/children', function (hooks) {
     await this.store.findAll('job');
 
     const parent = this.store.peekAll('job').findBy('plainId', 'parent');
+    const children = parent.get('children');
 
-    this.setProperties(props(parent));
+    this.setProperties(props(parent, children));
 
     await render(hbs`
       <JobPage::Parts::Children
@@ -56,7 +59,8 @@ module('Integration | Component | job-page/parts/children', function (hooks) {
         @sortProperty={{sortProperty}}
         @sortDescending={{sortDescending}}
         @currentPage={{currentPage}}
-        @gotoJob={{gotoJob}} />
+        @gotoJob={{gotoJob}}
+        @jobs={{children}} />
     `);
 
     assert.equal(
@@ -81,8 +85,9 @@ module('Integration | Component | job-page/parts/children', function (hooks) {
     await this.store.findAll('job');
 
     const parent = this.store.peekAll('job').findBy('plainId', 'parent');
+    const children = parent.get('children');
 
-    this.setProperties(props(parent));
+    this.setProperties(props(parent, children));
 
     await render(hbs`
       <JobPage::Parts::Children
@@ -90,6 +95,7 @@ module('Integration | Component | job-page/parts/children', function (hooks) {
         @sortProperty={{sortProperty}}
         @sortDescending={{sortDescending}}
         @currentPage={{currentPage}}
+        @jobs={{children}}
       />
     `);
 
@@ -127,8 +133,9 @@ module('Integration | Component | job-page/parts/children', function (hooks) {
     await this.store.findAll('job');
 
     const parent = this.store.peekAll('job').findBy('plainId', 'parent');
+    const children = parent.get('children');
 
-    this.setProperties(props(parent));
+    this.setProperties(props(parent, children));
 
     await render(hbs`
       <JobPage::Parts::Children
@@ -136,7 +143,8 @@ module('Integration | Component | job-page/parts/children', function (hooks) {
         @sortProperty={{sortProperty}}
         @sortDescending={{sortDescending}}
         @currentPage={{currentPage}}
-        @gotoJob={{gotoJob}} />
+        @gotoJob={{gotoJob}}
+        @jobs={{children}} />
     `);
 
     const sortedChildren = parent.get('children').sortBy('name');

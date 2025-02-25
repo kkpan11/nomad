@@ -1,5 +1,5 @@
 # Copyright (c) HashiCorp, Inc.
-# SPDX-License-Identifier: MPL-2.0
+# SPDX-License-Identifier: BUSL-1.1
 
 job "test" {
   datacenters = ["dc1"]
@@ -48,7 +48,6 @@ job "test" {
         on_update = "ignore_warnings"
 
         args = [
-          "-c",
           "/local/ready.sh"
         ]
 
@@ -95,4 +94,3 @@ EOT
     }
   }
 }
-

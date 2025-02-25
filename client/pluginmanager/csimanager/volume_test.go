@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package csimanager
 
@@ -9,7 +9,9 @@ import (
 	"os"
 	"runtime"
 	"testing"
+	"time"
 
+	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/nomad/ci"
 	"github.com/hashicorp/nomad/helper/mount"
 	"github.com/hashicorp/nomad/helper/testlog"
@@ -17,6 +19,7 @@ import (
 	"github.com/hashicorp/nomad/nomad/structs"
 	"github.com/hashicorp/nomad/plugins/csi"
 	csifake "github.com/hashicorp/nomad/plugins/csi/fake"
+	"github.com/shoenig/test/must"
 	"github.com/stretchr/testify/require"
 )
 
@@ -92,8 +95,10 @@ func TestVolumeManager_ensureStagingDir(t *testing.T) {
 
 			csiFake := &csifake.Client{}
 			eventer := func(e *structs.NodeEvent) {}
-			manager := newVolumeManager(testlog.HCLogger(t), eventer, csiFake, tmpPath, tmpPath, true)
-			expectedStagingPath := manager.stagingDirForVolume(tmpPath, tc.Volume.ID, tc.UsageOptions)
+			manager := newVolumeManager(testlog.HCLogger(t), eventer, csiFake,
+				tmpPath, tmpPath, true, "i-example")
+			expectedStagingPath := manager.stagingDirForVolume(tmpPath,
+				tc.Volume.Namespace, tc.Volume.ID, tc.UsageOptions)
 
 			if tc.CreateDirAheadOfTime {
 				err := os.MkdirAll(expectedStagingPath, 0700)
@@ -193,7 +198,8 @@ func TestVolumeManager_stageVolume(t *testing.T) {
 			csiFake.NextNodeStageVolumeErr = tc.PluginErr
 
 			eventer := func(e *structs.NodeEvent) {}
-			manager := newVolumeManager(testlog.HCLogger(t), eventer, csiFake, tmpPath, tmpPath, true)
+			manager := newVolumeManager(testlog.HCLogger(t), eventer, csiFake,
+				tmpPath, tmpPath, true, "i-example")
 			ctx := context.Background()
 
 			err := manager.stageVolume(ctx, tc.Volume, tc.UsageOptions, nil)
@@ -251,10 +257,12 @@ func TestVolumeManager_unstageVolume(t *testing.T) {
 			csiFake.NextNodeUnstageVolumeErr = tc.PluginErr
 
 			eventer := func(e *structs.NodeEvent) {}
-			manager := newVolumeManager(testlog.HCLogger(t), eventer, csiFake, tmpPath, tmpPath, true)
+			manager := newVolumeManager(testlog.HCLogger(t), eventer, csiFake,
+				tmpPath, tmpPath, true, "i-example")
 			ctx := context.Background()
 
 			err := manager.unstageVolume(ctx,
+				tc.Volume.Namespace,
 				tc.Volume.ID, tc.Volume.RemoteID(), tc.UsageOptions)
 
 			if tc.ExpectedErr != nil {
@@ -374,7 +382,8 @@ func TestVolumeManager_publishVolume(t *testing.T) {
 			csiFake.NextNodePublishVolumeErr = tc.PluginErr
 
 			eventer := func(e *structs.NodeEvent) {}
-			manager := newVolumeManager(testlog.HCLogger(t), eventer, csiFake, tmpPath, tmpPath, true)
+			manager := newVolumeManager(testlog.HCLogger(t), eventer, csiFake,
+				tmpPath, tmpPath, true, "i-example")
 			ctx := context.Background()
 
 			_, err := manager.publishVolume(ctx, tc.Volume, tc.Allocation, tc.UsageOptions, nil)
@@ -441,7 +450,8 @@ func TestVolumeManager_unpublishVolume(t *testing.T) {
 			csiFake.NextNodeUnpublishVolumeErr = tc.PluginErr
 
 			eventer := func(e *structs.NodeEvent) {}
-			manager := newVolumeManager(testlog.HCLogger(t), eventer, csiFake, tmpPath, tmpPath, true)
+			manager := newVolumeManager(testlog.HCLogger(t), eventer, csiFake,
+				tmpPath, tmpPath, true, "i-example")
 			ctx := context.Background()
 
 			err := manager.unpublishVolume(ctx,
@@ -473,7 +483,8 @@ func TestVolumeManager_MountVolumeEvents(t *testing.T) {
 		events = append(events, e)
 	}
 
-	manager := newVolumeManager(testlog.HCLogger(t), eventer, csiFake, tmpPath, tmpPath, true)
+	manager := newVolumeManager(testlog.HCLogger(t), eventer, csiFake,
+		tmpPath, tmpPath, true, "i-example")
 	ctx := context.Background()
 	vol := &structs.CSIVolume{
 		ID:        "vol",
@@ -508,7 +519,7 @@ func TestVolumeManager_MountVolumeEvents(t *testing.T) {
 	require.Equal(t, "true", e.Details["success"])
 	events = events[1:]
 
-	err = manager.UnmountVolume(ctx, vol.ID, vol.RemoteID(), alloc.ID, usage)
+	err = manager.UnmountVolume(ctx, vol.Namespace, vol.ID, vol.RemoteID(), alloc.ID, usage)
 	require.NoError(t, err)
 
 	require.Equal(t, 1, len(events))
@@ -517,4 +528,72 @@ func TestVolumeManager_MountVolumeEvents(t *testing.T) {
 	require.Equal(t, "Storage", e.Subsystem)
 	require.Equal(t, "vol", e.Details["volume_id"])
 	require.Equal(t, "true", e.Details["success"])
+}
+
+// TestVolumeManager_InterleavedStaging tests that a volume cannot be unstaged
+// if another alloc has staged but not yet published
+func TestVolumeManager_InterleavedStaging(t *testing.T) {
+	ci.Parallel(t)
+
+	tmpPath := t.TempDir()
+	csiFake := &csifake.Client{}
+
+	logger := testlog.HCLogger(t)
+	ctx := hclog.WithContext(context.Background(), logger)
+
+	manager := newVolumeManager(logger,
+		func(e *structs.NodeEvent) {}, csiFake,
+		tmpPath, tmpPath, true, "i-example")
+
+	alloc0, alloc1 := mock.Alloc(), mock.Alloc()
+	vol := &structs.CSIVolume{ID: "vol", Namespace: "ns"}
+	usage := &UsageOptions{
+		AccessMode:     structs.CSIVolumeAccessModeMultiNodeMultiWriter,
+		AttachmentMode: structs.CSIVolumeAttachmentModeFilesystem,
+	}
+	pubCtx := map[string]string{}
+
+	// first alloc has previously claimed the volume
+	manager.usageTracker.Claim(alloc0.ID, vol.ID, vol.Namespace, usage)
+
+	alloc0WaitCh := make(chan struct{})
+	alloc1WaitCh := make(chan struct{})
+
+	// this goroutine simulates MountVolume, but with control over interleaving
+	// by waiting for the other alloc to check if should unstage before trying
+	// to publish
+	manager.usageTracker.Claim(alloc1.ID, vol.ID, vol.Namespace, usage)
+	must.NoError(t, manager.stageVolume(ctx, vol, usage, pubCtx))
+
+	go func() {
+		defer close(alloc1WaitCh)
+		<-alloc0WaitCh
+		_, err := manager.publishVolume(ctx, vol, alloc1, usage, pubCtx)
+		must.NoError(t, err)
+	}()
+
+	must.NoError(t, manager.UnmountVolume(ctx, vol.Namespace, vol.ID, "foo", alloc0.ID, usage))
+	close(alloc0WaitCh)
+
+	testTimeoutCtx, cancel := context.WithTimeout(context.TODO(), time.Second)
+	t.Cleanup(cancel)
+
+	select {
+	case <-alloc1WaitCh:
+	case <-testTimeoutCtx.Done():
+		t.Fatal("test timed out")
+	}
+
+	key := volumeUsageKey{
+		id:        vol.ID,
+		ns:        vol.Namespace,
+		usageOpts: *usage,
+	}
+
+	manager.usageTracker.stateMu.Lock()
+	t.Cleanup(manager.usageTracker.stateMu.Unlock)
+	must.Eq(t, []string{alloc1.ID}, manager.usageTracker.state[key])
+
+	must.Eq(t, 1, csiFake.NodeUnpublishVolumeCallCount, must.Sprint("expected 1 unpublish call"))
+	must.Eq(t, 0, csiFake.NodeUnstageVolumeCallCount, must.Sprint("expected no unstage call"))
 }

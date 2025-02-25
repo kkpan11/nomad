@@ -1,6 +1,6 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 /* eslint-disable ember/no-test-module-for */
@@ -47,6 +47,7 @@ function moduleForJobDispatch(title, jobFactory) {
 
     hooks.beforeEach(function () {
       // Required for placing allocations (a result of dispatching jobs)
+      server.create('node-pool');
       server.create('node');
 
       job = jobFactory();

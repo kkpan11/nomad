@@ -1,6 +1,6 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 import {
@@ -26,6 +26,11 @@ export default create({
       options: collection('.ember-power-select-option', {
         label: text(),
       }),
+    },
+
+    singleRegion: {
+      scope: '.single-region',
+      text: text(),
     },
 
     search: {

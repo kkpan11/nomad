@@ -1,6 +1,6 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 import Controller from '@ember/controller';
@@ -113,7 +113,7 @@ export default class AllocationsController extends Controller.extend(
   @action
   gotoAllocation(allocation, event) {
     lazyClick([
-      () => this.transitionToRoute('allocations.allocation', allocation),
+      () => this.transitionToRoute('allocations.allocation', allocation.id),
       event,
     ]);
   }

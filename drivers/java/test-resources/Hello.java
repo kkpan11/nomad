@@ -1,11 +1,11 @@
 /*
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 public class Hello {
     public static void main(String[] args) {
-        System.out.println("Hello");
+        System.out.println("Hello, the current working directory is: " + System.getProperty("user.dir"));
         int seconds = 5;
         if (args.length != 0) {
             seconds = Integer.parseInt(args[0]);

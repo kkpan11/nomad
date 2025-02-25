@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package scheduler
 
@@ -49,6 +49,13 @@ type Context interface {
 	// SendEvent provides best-effort delivery of scheduling and placement
 	// events.
 	SendEvent(event interface{})
+}
+
+type ConstraintContext interface {
+	Metrics() *structs.AllocMetric
+	RegexpCache() map[string]*regexp.Regexp
+	VersionConstraintCache() map[string]VerConstraints
+	SemverConstraintCache() map[string]VerConstraints
 }
 
 // EvalCache is used to cache certain things during an evaluation

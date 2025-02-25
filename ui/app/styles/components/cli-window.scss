@@ -1,6 +1,6 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 .cli-window {
@@ -12,6 +12,10 @@
 
   code {
     height: 100%;
+
+    &.wrapped {
+      white-space: pre-wrap;
+    }
   }
 
   .is-light {

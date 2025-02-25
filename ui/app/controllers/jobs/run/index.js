@@ -1,6 +1,6 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 import { getOwner } from '@ember/application';
@@ -11,7 +11,7 @@ import { inject as service } from '@ember/service';
 export default class RunController extends Controller {
   @service router;
 
-  queryParams = ['template'];
+  queryParams = ['template', 'sourceString', 'disregardNameWarning'];
 
   @action
   handleSaveAsTemplate() {

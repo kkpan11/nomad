@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package structs
 
@@ -81,6 +81,7 @@ var (
 	ErrCSIClientRPCRetryable  = errors.New("CSI client error (retryable)")
 	ErrCSIVolumeMaxClaims     = errors.New("volume max claims reached")
 	ErrCSIVolumeUnschedulable = errors.New("volume is currently unschedulable")
+	ErrCSIPluginInUse         = errors.New("plugin in use")
 )
 
 // IsErrNoLeader returns whether the error is due to there being no leader.

@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package nomad
 
@@ -9,9 +9,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/armon/go-metrics"
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/go-memdb"
+	metrics "github.com/hashicorp/go-metrics/compat"
 
 	"github.com/hashicorp/nomad/acl"
 	"github.com/hashicorp/nomad/nomad/state"
@@ -41,6 +41,7 @@ var (
 		structs.ScalingPolicies,
 		structs.Variables,
 		structs.Namespaces,
+		structs.HostVolumes,
 	}
 )
 
@@ -83,6 +84,8 @@ func (s *Search) getPrefixMatches(iter memdb.ResultIterator, prefix string) ([]s
 		case *structs.CSIPlugin:
 			id = t.ID
 		case *structs.CSIVolume:
+			id = t.ID
+		case *structs.HostVolume:
 			id = t.ID
 		case *structs.ScalingPolicy:
 			id = t.ID
@@ -381,7 +384,7 @@ func sortSet(matches []fuzzyMatch) {
 func getResourceIter(context structs.Context, aclObj *acl.ACL, namespace, prefix string, ws memdb.WatchSet, store *state.StateStore) (memdb.ResultIterator, error) {
 	switch context {
 	case structs.Jobs:
-		return store.JobsByIDPrefix(ws, namespace, prefix)
+		return store.JobsByIDPrefix(ws, namespace, prefix, state.SortDefault)
 	case structs.Evals:
 		return store.EvalsByIDPrefix(ws, namespace, prefix, state.SortDefault)
 	case structs.Allocs:
@@ -393,7 +396,7 @@ func getResourceIter(context structs.Context, aclObj *acl.ACL, namespace, prefix
 		if err != nil {
 			return nil, err
 		}
-		if aclObj == nil || aclObj.IsManagement() {
+		if aclObj.IsManagement() {
 			return iter, nil
 		}
 		return memdb.NewFilterIterator(iter, nodePoolCapFilter(aclObj)), nil
@@ -405,22 +408,18 @@ func getResourceIter(context structs.Context, aclObj *acl.ACL, namespace, prefix
 		return store.ScalingPoliciesByIDPrefix(ws, namespace, prefix)
 	case structs.Volumes:
 		return store.CSIVolumesByIDPrefix(ws, namespace, prefix)
+	case structs.HostVolumes:
+		return store.HostVolumesByIDPrefix(ws, namespace, prefix, state.SortDefault)
 	case structs.Namespaces:
 		iter, err := store.NamespacesByNamePrefix(ws, prefix)
 		if err != nil {
 			return nil, err
-		}
-		if aclObj == nil {
-			return iter, nil
 		}
 		return memdb.NewFilterIterator(iter, nsCapFilter(aclObj)), nil
 	case structs.Variables:
 		iter, err := store.GetVariablesByPrefix(ws, prefix)
 		if err != nil {
 			return nil, err
-		}
-		if aclObj == nil {
-			return iter, nil
 		}
 		return memdb.NewFilterIterator(iter, nsCapFilter(aclObj)), nil
 	default:
@@ -439,10 +438,10 @@ func getFuzzyResourceIterator(context structs.Context, aclObj *acl.ACL, namespac
 	switch context {
 	case structs.Jobs:
 		if wildcard(namespace) {
-			iter, err := store.Jobs(ws)
+			iter, err := store.Jobs(ws, state.SortDefault)
 			return nsCapIterFilter(iter, err, aclObj)
 		}
-		return store.JobsByNamespace(ws, namespace)
+		return store.JobsByNamespace(ws, namespace, state.SortDefault)
 
 	case structs.Allocs:
 		if wildcard(namespace) {
@@ -471,7 +470,7 @@ func getFuzzyResourceIterator(context structs.Context, aclObj *acl.ACL, namespac
 			return nil, err
 		}
 
-		if aclObj == nil || aclObj.IsManagement() {
+		if aclObj.IsManagement() {
 			return iter, nil
 		}
 		return memdb.NewFilterIterator(iter, nodePoolCapFilter(aclObj)), nil
@@ -498,9 +497,6 @@ func getFuzzyResourceIterator(context structs.Context, aclObj *acl.ACL, namespac
 func nsCapIterFilter(iter memdb.ResultIterator, err error, aclObj *acl.ACL) (memdb.ResultIterator, error) {
 	if err != nil {
 		return nil, err
-	}
-	if aclObj == nil {
-		return iter, nil
 	}
 	return memdb.NewFilterIterator(iter, nsCapFilter(aclObj)), nil
 }
@@ -659,23 +655,16 @@ func (s *Search) PrefixSearch(args *structs.SearchRequest, reply *structs.Search
 	return s.srv.blockingRPC(&opts)
 }
 
-// sufficientSearchPerms returns true if the provided ACL has access to any
-// capabilities required for prefix searching.
+// sufficientSearchPerms returns true if the provided ACL has access to *any*
+// capabilities required for prefix searching. This is intended as a performance
+// improvement so that we don't do expensive queries and then filter the results
+// if the user will never get any results. The caller still needs to filter
+// anything it gets from the state store.
 //
 // Returns true if aclObj is nil or is for a management token
 func sufficientSearchPerms(aclObj *acl.ACL, namespace string, context structs.Context) bool {
-	if aclObj == nil || aclObj.IsManagement() {
+	if aclObj.IsManagement() {
 		return true
-	}
-
-	nodeRead := aclObj.AllowNodeRead()
-	allowNodePool := aclObj.AllowNodePoolSearch()
-	allowNS := aclObj.AllowNamespace(namespace)
-	jobRead := aclObj.AllowNsOp(namespace, acl.NamespaceCapabilityReadJob)
-	allowEnt := sufficientSearchPermsEnt(aclObj)
-
-	if !nodeRead && !allowNodePool && !allowNS && !allowEnt && !jobRead {
-		return false
 	}
 
 	// Reject requests that explicitly specify a disallowed context. This
@@ -683,24 +672,31 @@ func sufficientSearchPerms(aclObj *acl.ACL, namespace string, context structs.Co
 	// results and returning an empty list.
 	switch context {
 	case structs.Nodes:
-		return nodeRead
+		return aclObj.AllowNodeRead()
 	case structs.NodePools:
 		// The search term alone is not enough to determine if the token is
 		// allowed to access the given prefix since it may not match node pool
 		// label in the policy. Node pools will be filtered when iterating over
 		// the results.
-		return allowNodePool
+		return aclObj.AllowNodePoolSearch()
 	case structs.Namespaces:
-		return allowNS
-	case structs.Allocs, structs.Deployments, structs.Evals, structs.Jobs:
-		return jobRead
+		return aclObj.AllowNamespace(namespace)
+	case structs.Allocs, structs.Deployments, structs.Evals, structs.Jobs,
+		structs.ScalingPolicies, structs.Recommendations:
+		return aclObj.AllowNsOp(namespace, acl.NamespaceCapabilityReadJob)
 	case structs.Volumes:
 		return acl.NamespaceValidator(acl.NamespaceCapabilityCSIListVolume,
 			acl.NamespaceCapabilityCSIReadVolume,
 			acl.NamespaceCapabilityListJobs,
 			acl.NamespaceCapabilityReadJob)(aclObj, namespace)
+	case structs.HostVolumes:
+		return acl.NamespaceValidator(acl.NamespaceCapabilityHostVolumeRead)(aclObj, namespace)
 	case structs.Variables:
 		return aclObj.AllowVariableSearch(namespace)
+	case structs.Plugins:
+		return aclObj.AllowPluginList()
+	case structs.Quotas:
+		return aclObj.AllowQuotaRead()
 	}
 
 	return true
@@ -716,7 +712,7 @@ func sufficientSearchPerms(aclObj *acl.ACL, namespace string, context structs.Co
 //
 // These types are available for fuzzy searching:
 //
-//	Nodes, Node Pools, Namespaces, Jobs, Allocs, Plugins
+//	Nodes, Node Pools, Namespaces, Jobs, Allocs, Plugins, Variables
 //
 // Jobs are a special case that expand into multiple types, and whose return
 // values include Scope which is a descending list of IDs of parent objects,
@@ -785,7 +781,8 @@ func (s *Search) FuzzySearch(args *structs.FuzzySearchRequest, reply *structs.Fu
 			for _, ctx := range prefixContexts {
 				switch ctx {
 				// only apply on the types that use UUID prefix searching
-				case structs.Evals, structs.Deployments, structs.ScalingPolicies, structs.Volumes, structs.Quotas, structs.Recommendations:
+				case structs.Evals, structs.Deployments, structs.ScalingPolicies,
+					structs.Volumes, structs.HostVolumes, structs.Quotas, structs.Recommendations:
 					iter, err := getResourceIter(ctx, aclObj, namespace, roundUUIDDownIfOdd(args.Prefix, args.Context), ws, state)
 					if err != nil {
 						if !s.silenceError(err) {
@@ -801,7 +798,9 @@ func (s *Search) FuzzySearch(args *structs.FuzzySearchRequest, reply *structs.Fu
 			for _, ctx := range fuzzyContexts {
 				switch ctx {
 				// skip the types that use UUID prefix searching
-				case structs.Evals, structs.Deployments, structs.ScalingPolicies, structs.Volumes, structs.Quotas, structs.Recommendations:
+				case structs.Evals, structs.Deployments, structs.ScalingPolicies,
+					structs.Volumes, structs.HostVolumes, structs.Quotas,
+					structs.Recommendations:
 					continue
 				default:
 					iter, err := getFuzzyResourceIterator(ctx, aclObj, namespace, ws, state)
@@ -895,10 +894,6 @@ func sufficientFuzzySearchPerms(aclObj *acl.ACL, namespace string, context struc
 func filteredSearchContexts(aclObj *acl.ACL, namespace string, context structs.Context) []structs.Context {
 	desired := expandContext(context)
 
-	// If ACLs aren't enabled return all contexts
-	if aclObj == nil {
-		return desired
-	}
 	if aclObj.IsManagement() {
 		return desired
 	}
@@ -927,7 +922,7 @@ func filteredSearchContexts(aclObj *acl.ACL, namespace string, context structs.C
 				available = append(available, c)
 			}
 		case structs.Variables:
-			if jobRead {
+			if aclObj.AllowVariableSearch(namespace) {
 				available = append(available, c)
 			}
 		case structs.Nodes:
@@ -940,6 +935,15 @@ func filteredSearchContexts(aclObj *acl.ACL, namespace string, context structs.C
 			}
 		case structs.Volumes:
 			if volRead {
+				available = append(available, c)
+			}
+		case structs.HostVolumes:
+			if acl.NamespaceValidator(
+				acl.NamespaceCapabilityHostVolumeRead)(aclObj, namespace) {
+				available = append(available, c)
+			}
+		case structs.Plugins:
+			if aclObj.AllowPluginList() {
 				available = append(available, c)
 			}
 		default:

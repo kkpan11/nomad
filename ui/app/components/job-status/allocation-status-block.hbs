@@ -1,7 +1,14 @@
 {{!
   Copyright (c) HashiCorp, Inc.
-  SPDX-License-Identifier: MPL-2.0
+  SPDX-License-Identifier: BUSL-1.1
 ~}}
+
+{{!--
+  Exists as a "middleman" between AllocationStatusRow and IndividualAllocation
+  only when showSummaries in AllocationStatusRow is true (i.e. when the math of how
+  many allocations to show in each block is done x minWidth of each alloc exceeds
+  available space)
+--}}
 
 <div
   class="allocation-status-block {{unless this.countToShow "rest-only"}}"
@@ -10,26 +17,13 @@
   {{#if this.countToShow}}
     <div class="ungrouped-allocs">
       {{#each (range 0 this.countToShow) as |i|}}
-        <ConditionalLinkTo
-          @condition={{not (eq @status "unplaced")}}
-          @route="allocations.allocation"
-          @model={{get @allocs i}}
-          @class="represented-allocation {{@status}} {{@health}} {{@canary}}"
-          @label="View allocation"
-        >
-          {{#if (and (eq @status "running") (not @steady))}}
-            {{#if (eq @canary "canary")}}
-              <span class="alloc-canary-indicator" />
-            {{/if}}
-            <span class="alloc-health-indicator">
-              {{#if (eq @health "healthy")}}
-                <FlightIcon @name="check" @color="white" />
-              {{else}}
-                <FlightIcon @name="running" @color="white" />
-              {{/if}}
-            </span>
-          {{/if}}
-        </ConditionalLinkTo>
+        <JobStatus::IndividualAllocation
+          @allocation={{get @allocs i}}
+          @status={{@status}}
+          @health={{@health}}
+          @canary={{@canary}}
+          @steady={{@steady}}
+        />
       {{/each}}
     </div>
   {{/if}}
@@ -51,9 +45,11 @@
         {{#if (eq @status "running")}}
           <span class="alloc-health-indicator">
             {{#if (eq @health "healthy")}}
-              <FlightIcon @name="check" @color="#25ba81" />
+              <Hds::Icon @name="check" @color="#25ba81" @isInline={{true}} />
+            {{else if (eq @health "unhealthy")}}
+              <Hds::Icon @name="x" @color="#c84034" @isInline={{true}} />
             {{else}}
-              <FlightIcon @name="running" @color="black" />
+              <Hds::Icon @name="running" @color="black" @isInline={{true}} />
             {{/if}}
           </span>
         {{/if}}

@@ -7,26 +7,29 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/hashicorp/nomad/ci"
 	"github.com/hashicorp/nomad/client/allocdir"
-	"github.com/hashicorp/nomad/client/lib/cgutil"
+	"github.com/hashicorp/nomad/client/lib/cgroupslib"
 	"github.com/hashicorp/nomad/client/taskenv"
 	"github.com/hashicorp/nomad/client/testutil"
 	"github.com/hashicorp/nomad/drivers/shared/capabilities"
 	"github.com/hashicorp/nomad/helper/testlog"
 	"github.com/hashicorp/nomad/nomad/mock"
 	"github.com/hashicorp/nomad/plugins/drivers"
+	"github.com/hashicorp/nomad/plugins/drivers/fsisolation"
 	tu "github.com/hashicorp/nomad/testutil"
-	"github.com/opencontainers/runc/libcontainer/cgroups"
 	lconfigs "github.com/opencontainers/runc/libcontainer/configs"
 	"github.com/opencontainers/runc/libcontainer/devices"
+	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/shoenig/test"
 	"github.com/shoenig/test/must"
 	"github.com/stretchr/testify/require"
@@ -59,10 +62,12 @@ func testExecutorCommandWithChroot(t *testing.T) *testExecCmd {
 		"/lib64":            "/lib64",
 		"/usr/lib":          "/usr/lib",
 		"/bin/ls":           "/bin/ls",
+		"/bin/pwd":          "/bin/pwd",
 		"/bin/cat":          "/bin/cat",
 		"/bin/echo":         "/bin/echo",
 		"/bin/bash":         "/bin/bash",
 		"/bin/sleep":        "/bin/sleep",
+		"/bin/tail":         "/bin/tail",
 		"/foobar":           "/does/not/exist",
 	}
 
@@ -70,27 +75,29 @@ func testExecutorCommandWithChroot(t *testing.T) *testExecCmd {
 	task := alloc.Job.TaskGroups[0].Tasks[0]
 	taskEnv := taskenv.NewBuilder(mock.Node(), alloc, task, "global").Build()
 
-	allocDir := allocdir.NewAllocDir(testlog.HCLogger(t), os.TempDir(), alloc.ID)
+	allocDir := allocdir.NewAllocDir(testlog.HCLogger(t), os.TempDir(), os.TempDir(), alloc.ID)
 	if err := allocDir.Build(); err != nil {
 		t.Fatalf("AllocDir.Build() failed: %v", err)
 	}
-	if err := allocDir.NewTaskDir(task.Name).Build(true, chrootEnv); err != nil {
+	if err := allocDir.NewTaskDir(task).Build(fsisolation.Chroot, chrootEnv, task.User); err != nil {
 		allocDir.Destroy()
 		t.Fatalf("allocDir.NewTaskDir(%q) failed: %v", task.Name, err)
 	}
 	td := allocDir.TaskDirs[task.Name]
+
 	cmd := &ExecCommand{
 		Env:     taskEnv.List(),
 		TaskDir: td.Dir,
 		Resources: &drivers.Resources{
 			NomadResources: alloc.AllocatedResources.Tasks[task.Name],
+			LinuxResources: &drivers.LinuxResources{
+				CpusetCgroupPath: cgroupslib.LinuxResourcesPath(
+					alloc.ID,
+					task.Name,
+					alloc.AllocatedResources.UsesCores(),
+				),
+			},
 		},
-	}
-
-	if cgutil.UseV2 {
-		cmd.Resources.LinuxResources = &drivers.LinuxResources{
-			CpusetCgroupPath: filepath.Join(cgutil.CgroupRoot, "testing.scope", cgutil.CgroupScope(alloc.ID, task.Name)),
-		}
 	}
 
 	testCmd := &testExecCmd{
@@ -147,7 +154,7 @@ func TestExecutor_Isolation_PID_and_IPC_hostMode(t *testing.T) {
 	execCmd.ModePID = "host" // disable PID namespace
 	execCmd.ModeIPC = "host" // disable IPC namespace
 
-	executor := NewExecutorWithIsolation(testlog.HCLogger(t))
+	executor := NewExecutorWithIsolation(testlog.HCLogger(t), compute)
 	defer executor.Shutdown("SIGKILL", 0)
 
 	ps, err := executor.Launch(execCmd)
@@ -190,7 +197,7 @@ func TestExecutor_IsolationAndConstraints(t *testing.T) {
 	execCmd.ModePID = "private"
 	execCmd.ModeIPC = "private"
 
-	executor := NewExecutorWithIsolation(testlog.HCLogger(t))
+	executor := NewExecutorWithIsolation(testlog.HCLogger(t), compute)
 	defer executor.Shutdown("SIGKILL", 0)
 
 	ps, err := executor.Launch(execCmd)
@@ -244,6 +251,7 @@ etc/
 lib/
 lib64/
 local/
+private/
 proc/
 secrets/
 sys/
@@ -265,6 +273,40 @@ passwd`
 	}, func(err error) { t.Error(err) })
 }
 
+func TestExecutor_OOMKilled(t *testing.T) {
+	ci.Parallel(t)
+	testutil.ExecCompatible(t)
+	testutil.CgroupsCompatible(t)
+
+	testExecCmd := testExecutorCommandWithChroot(t)
+	execCmd, allocDir := testExecCmd.command, testExecCmd.allocDir
+	execCmd.Cmd = "/bin/tail"
+	execCmd.Args = []string{"/dev/zero"}
+	defer allocDir.Destroy()
+
+	execCmd.ResourceLimits = true
+	execCmd.ModePID = "private"
+	execCmd.ModeIPC = "private"
+	execCmd.Resources.LinuxResources.MemoryLimitBytes = 10 * 1024 * 1024
+	execCmd.Resources.NomadResources.Memory.MemoryMB = 10
+
+	executor := NewExecutorWithIsolation(testlog.HCLogger(t), compute)
+	defer executor.Shutdown("SIGKILL", 0)
+
+	ps, err := executor.Launch(execCmd)
+	must.NoError(t, err)
+	must.Positive(t, ps.Pid)
+
+	estate, err := executor.Wait(context.Background())
+	must.NoError(t, err)
+	must.Positive(t, estate.ExitCode)
+	must.True(t, estate.OOMKilled)
+
+	// Shut down executor
+	must.NoError(t, executor.Shutdown("", 0))
+	executor.Wait(context.Background())
+}
+
 // TestExecutor_CgroupPaths asserts that process starts with independent cgroups
 // hierarchy created for this process
 func TestExecutor_CgroupPaths(t *testing.T) {
@@ -281,7 +323,7 @@ func TestExecutor_CgroupPaths(t *testing.T) {
 
 	execCmd.ResourceLimits = true
 
-	executor := NewExecutorWithIsolation(testlog.HCLogger(t))
+	executor := NewExecutorWithIsolation(testlog.HCLogger(t), compute)
 	defer executor.Shutdown("SIGKILL", 0)
 
 	ps, err := executor.Launch(execCmd)
@@ -294,11 +336,11 @@ func TestExecutor_CgroupPaths(t *testing.T) {
 
 	tu.WaitForResult(func() (bool, error) {
 		output := strings.TrimSpace(testExecCmd.stdout.String())
-		switch cgutil.UseV2 {
-		case true:
+		switch cgroupslib.GetMode() {
+		case cgroupslib.CG2:
 			isScope := strings.HasSuffix(output, ".scope")
 			require.True(isScope)
-		case false:
+		default:
 			// Verify that we got some cgroups
 			if !strings.Contains(output, ":devices:") {
 				return false, fmt.Errorf("was expected cgroup files but found:\n%v", output)
@@ -325,93 +367,6 @@ func TestExecutor_CgroupPaths(t *testing.T) {
 		}
 		return true, nil
 	}, func(err error) { t.Error(err) })
-}
-
-// TestExecutor_CgroupPaths asserts that all cgroups created for a task
-// are destroyed on shutdown
-func TestExecutor_CgroupPathsAreDestroyed(t *testing.T) {
-	ci.Parallel(t)
-	testutil.ExecCompatible(t)
-
-	require := require.New(t)
-
-	testExecCmd := testExecutorCommandWithChroot(t)
-	execCmd, allocDir := testExecCmd.command, testExecCmd.allocDir
-	execCmd.Cmd = "/bin/bash"
-	execCmd.Args = []string{"-c", "sleep 0.2; cat /proc/self/cgroup"}
-	defer allocDir.Destroy()
-
-	execCmd.ResourceLimits = true
-
-	executor := NewExecutorWithIsolation(testlog.HCLogger(t))
-	defer executor.Shutdown("SIGKILL", 0)
-
-	ps, err := executor.Launch(execCmd)
-	require.NoError(err)
-	require.NotZero(ps.Pid)
-
-	state, err := executor.Wait(context.Background())
-	require.NoError(err)
-	require.Zero(state.ExitCode)
-
-	var cgroupsPaths string
-	tu.WaitForResult(func() (bool, error) {
-		output := strings.TrimSpace(testExecCmd.stdout.String())
-
-		switch cgutil.UseV2 {
-		case true:
-			isScope := strings.HasSuffix(output, ".scope")
-			require.True(isScope)
-		case false:
-			// Verify that we got some cgroups
-			if !strings.Contains(output, ":devices:") {
-				return false, fmt.Errorf("was expected cgroup files but found:\n%v", output)
-			}
-			lines := strings.Split(output, "\n")
-			for _, line := range lines {
-				// Every cgroup entry should be /nomad/$ALLOC_ID
-				if line == "" {
-					continue
-				}
-
-				// Skip rdma subsystem; rdma was added in most recent kernels and libcontainer/docker
-				// don't isolate it by default. And also misc.
-				if strings.Contains(line, ":rdma:") || strings.Contains(line, "::") || strings.Contains(line, ":misc:") {
-					continue
-				}
-
-				if !strings.Contains(line, ":/nomad/") {
-					return false, fmt.Errorf("Not a member of the alloc's cgroup: expected=...:/nomad/... -- found=%q", line)
-				}
-			}
-		}
-		cgroupsPaths = output
-		return true, nil
-	}, func(err error) { t.Error(err) })
-
-	// shutdown executor and test that cgroups are destroyed
-	executor.Shutdown("SIGKILL", 0)
-
-	// test that the cgroup paths are not visible
-	tmpFile, err := os.CreateTemp("", "")
-	require.NoError(err)
-	defer os.Remove(tmpFile.Name())
-
-	_, err = tmpFile.WriteString(cgroupsPaths)
-	require.NoError(err)
-	tmpFile.Close()
-
-	subsystems, err := cgroups.ParseCgroupFile(tmpFile.Name())
-	require.NoError(err)
-
-	for subsystem, cgroup := range subsystems {
-		if subsystem == "" || !strings.Contains(cgroup, "nomad/") {
-			continue
-		}
-		p, err := cgutil.GetCgroupPathHelperV1(subsystem, cgroup)
-		require.NoError(err)
-		require.Falsef(cgroups.PathExists(p), "cgroup for %s %s still exists", subsystem, cgroup)
-	}
 }
 
 func TestExecutor_LookupTaskBin(t *testing.T) {
@@ -546,7 +501,7 @@ func TestExecutor_EscapeContainer(t *testing.T) {
 
 	execCmd.ResourceLimits = true
 
-	executor := NewExecutorWithIsolation(testlog.HCLogger(t))
+	executor := NewExecutorWithIsolation(testlog.HCLogger(t), compute)
 	defer executor.Shutdown("SIGKILL", 0)
 
 	_, err := executor.Launch(execCmd)
@@ -596,7 +551,7 @@ func TestExecutor_DoesNotInheritOomScoreAdj(t *testing.T) {
 	execCmd.Cmd = "/bin/bash"
 	execCmd.Args = []string{"-c", "cat /proc/self/oom_score_adj"}
 
-	executor := NewExecutorWithIsolation(testlog.HCLogger(t))
+	executor := NewExecutorWithIsolation(testlog.HCLogger(t), compute)
 	defer executor.Shutdown("SIGKILL", 0)
 
 	_, err = executor.Launch(execCmd)
@@ -690,7 +645,7 @@ CapAmb: 0000000000000400`,
 				execCmd.Capabilities = capsAllowed
 			}
 
-			executor := NewExecutorWithIsolation(testlog.HCLogger(t))
+			executor := NewExecutorWithIsolation(testlog.HCLogger(t), compute)
 			defer executor.Shutdown("SIGKILL", 0)
 
 			_, err := executor.Launch(execCmd)
@@ -738,7 +693,7 @@ func TestExecutor_ClientCleanup(t *testing.T) {
 	execCmd, allocDir := testExecCmd.command, testExecCmd.allocDir
 	defer allocDir.Destroy()
 
-	executor := NewExecutorWithIsolation(testlog.HCLogger(t))
+	executor := NewExecutorWithIsolation(testlog.HCLogger(t), compute)
 	defer executor.Shutdown("", 0)
 
 	// Need to run a command which will produce continuous output but not
@@ -790,6 +745,7 @@ func TestExecutor_cmdDevices(t *testing.T) {
 			Major:       1,
 			Minor:       3,
 			Permissions: "rwm",
+			Allow:       true,
 		},
 		Path: "/task/dev/null",
 	}
@@ -843,45 +799,238 @@ func TestExecutor_cmdMounts(t *testing.T) {
 	require.EqualValues(t, expected, cmdMounts(input))
 }
 
-// TestUniversalExecutor_NoCgroup asserts that commands are executed in the
-// same cgroup as parent process
-func TestUniversalExecutor_NoCgroup(t *testing.T) {
-	ci.Parallel(t)
+func TestExecutor_WorkDir(t *testing.T) {
+	t.Parallel()
 	testutil.ExecCompatible(t)
 
-	expectedBytes, err := os.ReadFile("/proc/self/cgroup")
-	require.NoError(t, err)
-
-	expected := strings.TrimSpace(string(expectedBytes))
-
-	testExecCmd := testExecutorCommand(t)
+	testExecCmd := testExecutorCommandWithChroot(t)
 	execCmd, allocDir := testExecCmd.command, testExecCmd.allocDir
-	execCmd.Cmd = "/bin/cat"
-	execCmd.Args = []string{"/proc/self/cgroup"}
 	defer allocDir.Destroy()
 
-	execCmd.BasicProcessCgroup = false
-	execCmd.ResourceLimits = false
+	execCmd.ResourceLimits = true
+	workDir := "/etc"
+	execCmd.WorkDir = workDir
+	execCmd.Cmd = "/bin/pwd"
 
-	executor := NewExecutor(testlog.HCLogger(t))
+	executor := NewExecutorWithIsolation(testlog.HCLogger(t), compute)
 	defer executor.Shutdown("SIGKILL", 0)
 
-	_, err = executor.Launch(execCmd)
-	require.NoError(t, err)
+	ps, err := executor.Launch(execCmd)
+	must.NoError(t, err)
+	must.NonZero(t, ps.Pid)
 
-	_, err = executor.Wait(context.Background())
-	require.NoError(t, err)
+	state, err := executor.Wait(context.Background())
+	must.NoError(t, err)
+	must.Zero(t, state.ExitCode)
 
-	tu.WaitForResult(func() (bool, error) {
-		act := strings.TrimSpace(string(testExecCmd.stdout.String()))
-		if expected != act {
-			return false, fmt.Errorf("expected:\n%s actual:\n%s", expected, act)
+	output := strings.TrimSpace(testExecCmd.stdout.String())
+	must.Eq(t, output, workDir)
+}
+
+func TestExecCommand_getCgroupOr_off(t *testing.T) {
+	ci.Parallel(t)
+
+	if cgroupslib.GetMode() != cgroupslib.OFF {
+		t.Skip("test only runs with no cgroups")
+	}
+
+	ec := new(ExecCommand)
+	result := ec.getCgroupOr("cpuset", "/sys/fs/cgroup/cpuset/nomad/abc123")
+	must.Eq(t, "", result)
+}
+
+func TestExecCommand_getCgroupOr_v1_absolute(t *testing.T) {
+	ci.Parallel(t)
+
+	if cgroupslib.GetMode() != cgroupslib.CG1 {
+		t.Skip("test only runs on cgroups v1")
+	}
+
+	t.Run("unset", func(t *testing.T) {
+		ec := &ExecCommand{
+			OverrideCgroupV1: nil,
 		}
-		return true, nil
-	}, func(err error) {
-		stderr := strings.TrimSpace(string(testExecCmd.stderr.String()))
-		t.Logf("stderr: %v", stderr)
-		require.NoError(t, err)
+		result := ec.getCgroupOr("pids", "/sys/fs/cgroup/pids/nomad/abc123")
+		must.Eq(t, result, "/sys/fs/cgroup/pids/nomad/abc123")
+		result2 := ec.getCgroupOr("cpuset", "/sys/fs/cgroup/cpuset/nomad/abc123")
+		must.Eq(t, result2, "/sys/fs/cgroup/cpuset/nomad/abc123")
+
 	})
 
+	t.Run("set", func(t *testing.T) {
+		ec := &ExecCommand{
+			OverrideCgroupV1: map[string]string{
+				"pids":   "/sys/fs/cgroup/pids/custom/path",
+				"cpuset": "/sys/fs/cgroup/cpuset/custom/path",
+			},
+		}
+		result := ec.getCgroupOr("pids", "/sys/fs/cgroup/pids/nomad/abc123")
+		must.Eq(t, result, "/sys/fs/cgroup/pids/custom/path")
+		result2 := ec.getCgroupOr("cpuset", "/sys/fs/cgroup/cpuset/nomad/abc123")
+		must.Eq(t, result2, "/sys/fs/cgroup/cpuset/custom/path")
+	})
+}
+
+func TestExecCommand_getCgroupOr_v1_relative(t *testing.T) {
+	ci.Parallel(t)
+
+	if cgroupslib.GetMode() != cgroupslib.CG1 {
+		t.Skip("test only runs on cgroups v1")
+	}
+
+	ec := &ExecCommand{
+		OverrideCgroupV1: map[string]string{
+			"pids":   "custom/path",
+			"cpuset": "custom/path",
+		},
+	}
+	result := ec.getCgroupOr("pids", "/sys/fs/cgroup/pids/nomad/abc123")
+	must.Eq(t, result, "/sys/fs/cgroup/pids/custom/path")
+	result2 := ec.getCgroupOr("cpuset", "/sys/fs/cgroup/cpuset/nomad/abc123")
+	must.Eq(t, result2, "/sys/fs/cgroup/cpuset/custom/path")
+}
+
+func createCGroup(fullpath string) (cgroupslib.Interface, error) {
+	if err := os.MkdirAll(fullpath, 0755); err != nil {
+		return nil, err
+	}
+
+	return cgroupslib.OpenPath(fullpath), nil
+}
+
+func TestExecutor_CleanOldProcessesInCGroup(t *testing.T) {
+	ci.Parallel(t)
+
+	testutil.ExecCompatible(t)
+	testutil.CgroupsCompatible(t)
+
+	testExecCmd := testExecutorCommandWithChroot(t)
+
+	allocDir := testExecCmd.allocDir
+	defer allocDir.Destroy()
+
+	fullCGroupPath := testExecCmd.command.Resources.LinuxResources.CpusetCgroupPath
+
+	execCmd := testExecCmd.command
+	execCmd.Cmd = "/bin/sleep"
+	execCmd.Args = []string{"1"}
+	execCmd.ResourceLimits = true
+	execCmd.ModePID = "private"
+	execCmd.ModeIPC = "private"
+
+	// Create the CGroup the executor's command will run in and populate it with one process
+	cgInterface, err := createCGroup(fullCGroupPath)
+	must.NoError(t, err)
+
+	cmd := exec.Command("/bin/sleep", "3000")
+	err = cmd.Start()
+	must.NoError(t, err)
+
+	go func() {
+		err := cmd.Wait()
+		//This process will be killed by the executor as a prerequisite to run
+		// the executors command.
+		must.Error(t, err)
+	}()
+
+	pid := cmd.Process.Pid
+	must.Positive(t, pid)
+
+	err = cgInterface.Write("cgroup.procs", strconv.Itoa(pid))
+	must.NoError(t, err)
+
+	pids, err := cgInterface.PIDs()
+	must.NoError(t, err)
+	must.One(t, pids.Size())
+
+	// Run the executor normally and make sure the process that was originally running
+	// as part of the CGroup was killed, and only the executor's process is running.
+	execInterface := NewExecutorWithIsolation(testlog.HCLogger(t), compute)
+	executor := execInterface.(*LibcontainerExecutor)
+	defer executor.Shutdown("SIGKILL", 0)
+
+	ps, err := executor.Launch(execCmd)
+	must.NoError(t, err)
+	must.Positive(t, ps.Pid)
+
+	pids, err = cgInterface.PIDs()
+	must.NoError(t, err)
+	must.One(t, pids.Size())
+	must.True(t, pids.Contains(ps.Pid))
+	must.False(t, pids.Contains(pid))
+
+	estate, err := executor.Wait(context.Background())
+	must.NoError(t, err)
+	must.Zero(t, estate.ExitCode)
+
+	must.NoError(t, executor.Shutdown("", 0))
+	executor.Wait(context.Background())
+}
+
+func TestExecutor_SignalCatching(t *testing.T) {
+	ci.Parallel(t)
+
+	testutil.ExecCompatible(t)
+	testutil.CgroupsCompatible(t)
+
+	testExecCmd := testExecutorCommandWithChroot(t)
+
+	allocDir := testExecCmd.allocDir
+	defer allocDir.Destroy()
+
+	execCmd := testExecCmd.command
+	execCmd.Cmd = "/bin/sleep"
+	execCmd.Args = []string{"100"}
+	execCmd.ResourceLimits = true
+	execCmd.ModePID = "private"
+	execCmd.ModeIPC = "private"
+
+	execInterface := NewExecutorWithIsolation(testlog.HCLogger(t), compute)
+
+	ps, err := execInterface.Launch(execCmd)
+	must.NoError(t, err)
+	must.Positive(t, ps.Pid)
+
+	executor := execInterface.(*LibcontainerExecutor)
+	status, err := executor.container.OCIState()
+	must.NoError(t, err)
+	must.Eq(t, specs.StateRunning, status.Status)
+
+	executor.sigChan <- syscall.SIGTERM
+	time.Sleep(1 * time.Second)
+
+	status, err = executor.container.OCIState()
+	must.NoError(t, err)
+	must.Eq(t, specs.StateStopped, status.Status)
+}
+
+// non-default devices must be present in cgroup device rules
+func TestCgroupDeviceRules(t *testing.T) {
+	ci.Parallel(t)
+	testutil.ExecCompatible(t)
+	testExecCmd := testExecutorCommand(t)
+	command := testExecCmd.command
+
+	allocDir := testExecCmd.allocDir
+	defer allocDir.Destroy()
+
+	command.Devices = append(command.Devices,
+		// /dev/fuse is not in the default device list
+		&drivers.DeviceConfig{
+			HostPath:    "/dev/fuse",
+			TaskPath:    "/dev/fuse",
+			Permissions: "rwm",
+		})
+	execInterface := NewExecutorWithIsolation(testlog.HCLogger(t), compute)
+	executor := execInterface.(*LibcontainerExecutor)
+	cfg, err := executor.newLibcontainerConfig(command)
+	must.NoError(t, err)
+
+	must.SliceContains(t, cfg.Cgroups.Devices, &devices.Rule{
+		Type:        'c',
+		Major:       0x0a,
+		Minor:       0xe5,
+		Permissions: "rwm",
+		Allow:       true,
+	})
 }

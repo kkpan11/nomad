@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package taskrunner
 
@@ -95,6 +95,7 @@ func (h *volumeHook) hostVolumeMountConfigurations(taskMounts []*structs.VolumeM
 			TaskPath:        m.Destination,
 			Readonly:        hostVolume.ReadOnly || req.ReadOnly || m.ReadOnly,
 			PropagationMode: m.PropagationMode,
+			SELinuxLabel:    m.SELinuxLabel,
 		}
 		mounts = append(mounts, mcfg)
 	}
@@ -188,6 +189,7 @@ func (h *volumeHook) prepareCSIVolumes(req *interfaces.TaskPrestartRequest, volu
 				TaskPath:        m.Destination,
 				Readonly:        request.ReadOnly || m.ReadOnly,
 				PropagationMode: m.PropagationMode,
+				SELinuxLabel:    m.SELinuxLabel,
 			}
 			mounts = append(mounts, mcfg)
 		}

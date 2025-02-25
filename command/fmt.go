@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package command
 
@@ -280,7 +280,7 @@ func (f *FormatCommand) processFile(path string, r io.Reader) {
 	}
 
 	if f.writeStdout {
-		f.Ui.Output(string(out))
+		formattedFile.WriteTo(os.Stdout)
 	}
 }
 

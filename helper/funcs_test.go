@@ -1,65 +1,21 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package helper
 
 import (
+	"errors"
 	"fmt"
+	"maps"
 	"reflect"
 	"sort"
 	"testing"
 
-	"github.com/hashicorp/go-set"
+	multierror "github.com/hashicorp/go-multierror"
+	"github.com/hashicorp/go-set/v3"
 	"github.com/shoenig/test/must"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/exp/maps"
 )
-
-func Test_Min(t *testing.T) {
-	t.Run("int", func(t *testing.T) {
-		a := 1
-		b := 2
-		must.Eq(t, 1, Min(a, b))
-		must.Eq(t, 1, Min(b, a))
-	})
-
-	t.Run("float64", func(t *testing.T) {
-		a := 1.1
-		b := 2.2
-		must.Eq(t, 1.1, Min(a, b))
-		must.Eq(t, 1.1, Min(b, a))
-	})
-
-	t.Run("string", func(t *testing.T) {
-		a := "cat"
-		b := "dog"
-		must.Eq(t, "cat", Min(a, b))
-		must.Eq(t, "cat", Min(b, a))
-	})
-}
-
-func Test_Max(t *testing.T) {
-	t.Run("int", func(t *testing.T) {
-		a := 1
-		b := 2
-		must.Eq(t, 2, Max(a, b))
-		must.Eq(t, 2, Max(b, a))
-	})
-
-	t.Run("float64", func(t *testing.T) {
-		a := 1.1
-		b := 2.2
-		must.Eq(t, 2.2, Max(a, b))
-		must.Eq(t, 2.2, Max(b, a))
-	})
-
-	t.Run("string", func(t *testing.T) {
-		a := "cat"
-		b := "dog"
-		must.Eq(t, "dog", Max(a, b))
-		must.Eq(t, "dog", Max(b, a))
-	})
-}
 
 func TestIsSubset(t *testing.T) {
 	l := []string{"a", "b", "c"}
@@ -528,4 +484,47 @@ func Test_SliceSetEq(t *testing.T) {
 		b := []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
 		must.True(t, SliceSetEq(a, b))
 	})
+}
+
+func TestFlattenMultiError(t *testing.T) {
+
+	err := FlattenMultierror(nil)
+	must.Nil(t, err)
+
+	err0 := errors.New("oh no!")
+	err = FlattenMultierror(err0)
+	must.Eq(t, `oh no!`, err.Error())
+
+	var mErr0 *multierror.Error
+	err = FlattenMultierror(mErr0)
+	must.Nil(t, err)
+
+	mErr0 = multierror.Append(mErr0, func() error {
+		return nil
+	}())
+	err = FlattenMultierror(mErr0)
+	must.Nil(t, err)
+
+	var mErr1 *multierror.Error
+	mErr1 = multierror.Append(mErr1, func() error {
+		var mErr *multierror.Error
+		mErr = multierror.Append(mErr, errors.New("inner1"))
+		return mErr
+	}())
+	err = FlattenMultierror(mErr1)
+	must.Eq(t, `inner1`, err.Error())
+
+	var mErr2 *multierror.Error
+	mErr2 = multierror.Append(mErr2, func() error {
+		var mErr *multierror.Error
+		mErr = multierror.Append(mErr, errors.New("inner1"))
+		mErr = multierror.Append(mErr, errors.New("inner2"))
+		return mErr
+	}())
+	err = FlattenMultierror(mErr2)
+	must.Eq(t, `2 errors occurred:
+	* inner1
+	* inner2
+
+`, err.Error())
 }

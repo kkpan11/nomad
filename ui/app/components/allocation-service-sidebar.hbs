@@ -1,6 +1,6 @@
 {{!
   Copyright (c) HashiCorp, Inc.
-  SPDX-License-Identifier: MPL-2.0
+  SPDX-License-Identifier: BUSL-1.1
 ~}}
 
 <div
@@ -18,10 +18,15 @@
         {{#if (not-eq @service.provider "consul")}}
           <span class="aggregate-status">
             {{#if (eq this.aggregateStatus 'Unhealthy')}}
-              <FlightIcon @name="x-square-fill" @color="#c84034" />
+              <Hds::Icon @name="x-square-fill" @color="#c84034" @isInline={{true}} />
               Unhealthy
+            {{else if (eq this.aggregateStatus 'Unknown')}}
+            <Tooltip @text="The parent allocation for this service is not running" @isFullText={{true}}>
+              <Hds::Icon @name="help" @color="#999999" @isInline={{true}} />
+              Health Unknown
+            </Tooltip>
             {{else}}
-              <FlightIcon @name="check-square-fill" @color="#25ba81" />
+              <Hds::Icon @name="check-square-fill" @color="#25ba81" @isInline={{true}} />
               Healthy
             {{/if}}
           </span>
@@ -128,10 +133,10 @@
             <td class="status">
               <span>
                 {{#if (eq row.model.Status "success")}}
-                  <FlightIcon @name="check-square-fill" @color="#25ba81" />
+                  <Hds::Icon @name="check-square-fill" @color="#25ba81" @isInline={{true}} />
                   Healthy
                 {{else if (eq row.model.Status "failure")}}
-                  <FlightIcon @name="x-square-fill" @color="#c84034" />
+                  <Hds::Icon @name="x-square-fill" @color="#c84034" @isInline={{true}} />
                   Unhealthy
                 {{else if (eq row.model.Status "pending")}}
                   Pending

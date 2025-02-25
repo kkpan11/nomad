@@ -1,6 +1,6 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 import { Factory } from 'ember-cli-mirage';
@@ -52,9 +52,9 @@ export default Factory.extend({
         });
       }
       if (!service.allocId) {
-        const servicedAlloc = pickOne(
-          server.db.allocations.filter((a) => a.jobId === 'service-haver') || []
-        );
+        const servicedAlloc = (server.db.allocations.filter(
+          (a) => a.jobId === 'service-haver'
+        ) || [])[0];
         if (servicedAlloc) {
           service.update({
             allocId: servicedAlloc.id,

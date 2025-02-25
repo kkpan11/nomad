@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package command
 
@@ -30,10 +30,10 @@ General Options:
   ` + generalOptionsUsage(usageOptsDefault|usageOptsNoNamespace) + `
 
 Status Specific Options:
-  
+
   -json
     Output the latest namespace status information in a JSON format.
-  
+
   -t
     Format and display namespace status information using a Go template.
 `
@@ -149,6 +149,51 @@ func (c *NamespaceStatusCommand) Run(args []string) int {
 		}
 	}
 
+	if ns.NodePoolConfiguration != nil {
+		c.Ui.Output(c.Colorize().Color("\n[bold]Node Pool Configuration[reset]"))
+		npConfig := ns.NodePoolConfiguration
+		npConfigOut := []string{
+			fmt.Sprintf("Default|%s", npConfig.Default),
+		}
+		if len(npConfig.Allowed) > 0 {
+			npConfigOut = append(npConfigOut, fmt.Sprintf("Allowed|%s", strings.Join(npConfig.Allowed, ", ")))
+		}
+		if len(npConfig.Denied) > 0 {
+			npConfigOut = append(npConfigOut, fmt.Sprintf("Denied|%s", strings.Join(npConfig.Denied, ", ")))
+		}
+		c.Ui.Output(formatKV(npConfigOut))
+	}
+
+	if ns.VaultConfiguration != nil {
+		c.Ui.Output(c.Colorize().Color("\n[bold]Vault Configuration[reset]"))
+		vConfig := ns.VaultConfiguration
+		vConfigOut := []string{
+			fmt.Sprintf("Default|%s", vConfig.Default),
+		}
+		if len(vConfig.Allowed) > 0 {
+			vConfigOut = append(vConfigOut, fmt.Sprintf("Allowed|%s", strings.Join(vConfig.Allowed, ", ")))
+		}
+		if len(vConfig.Denied) > 0 {
+			vConfigOut = append(vConfigOut, fmt.Sprintf("Denied|%s", strings.Join(vConfig.Denied, ", ")))
+		}
+		c.Ui.Output(formatKV(vConfigOut))
+	}
+
+	if ns.ConsulConfiguration != nil {
+		c.Ui.Output(c.Colorize().Color("\n[bold]Consul Configuration[reset]"))
+		cConfig := ns.ConsulConfiguration
+		cConfigOut := []string{
+			fmt.Sprintf("Default|%s", cConfig.Default),
+		}
+		if len(cConfig.Allowed) > 0 {
+			cConfigOut = append(cConfigOut, fmt.Sprintf("Allowed|%s", strings.Join(cConfig.Allowed, ", ")))
+		}
+		if len(cConfig.Denied) > 0 {
+			cConfigOut = append(cConfigOut, fmt.Sprintf("Denied|%s", strings.Join(cConfig.Denied, ", ")))
+		}
+		c.Ui.Output(formatKV(cConfigOut))
+	}
+
 	return 0
 }
 
@@ -156,6 +201,8 @@ func (c *NamespaceStatusCommand) Run(args []string) int {
 func formatNamespaceBasics(ns *api.Namespace) string {
 	enabled_drivers := "*"
 	disabled_drivers := ""
+	enabled_network_modes := "*"
+	disabled_network_modes := ""
 	if ns.Capabilities != nil {
 		if len(ns.Capabilities.EnabledTaskDrivers) != 0 {
 			enabled_drivers = strings.Join(ns.Capabilities.EnabledTaskDrivers, ",")
@@ -163,13 +210,21 @@ func formatNamespaceBasics(ns *api.Namespace) string {
 		if len(ns.Capabilities.DisabledTaskDrivers) != 0 {
 			disabled_drivers = strings.Join(ns.Capabilities.DisabledTaskDrivers, ",")
 		}
+		if len(ns.Capabilities.EnabledNetworkModes) != 0 {
+			enabled_network_modes = strings.Join(ns.Capabilities.EnabledNetworkModes, ",")
+		}
+		if len(ns.Capabilities.DisabledNetworkModes) != 0 {
+			disabled_network_modes = strings.Join(ns.Capabilities.DisabledNetworkModes, ",")
+		}
 	}
 	basic := []string{
 		fmt.Sprintf("Name|%s", ns.Name),
 		fmt.Sprintf("Description|%s", ns.Description),
 		fmt.Sprintf("Quota|%s", ns.Quota),
-		fmt.Sprintf("EnabledDrivers|%s", enabled_drivers),
-		fmt.Sprintf("DisabledDrivers|%s", disabled_drivers),
+		fmt.Sprintf("Enabled Drivers|%s", enabled_drivers),
+		fmt.Sprintf("Disabled Drivers|%s", disabled_drivers),
+		fmt.Sprintf("Enabled Network Modes|%s", enabled_network_modes),
+		fmt.Sprintf("Disabled Network Modes|%s", disabled_network_modes),
 	}
 
 	return formatKV(basic)

@@ -1,14 +1,14 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package checks
 
 import (
+	"maps"
 	"net/http"
 	"time"
 
 	"github.com/hashicorp/nomad/nomad/structs"
-	"golang.org/x/exp/maps"
 )
 
 // GetCheckQuery extracts the needed info from c to actually execute the check.
@@ -18,16 +18,17 @@ func GetCheckQuery(c *structs.ServiceCheck) *Query {
 		protocol = "http"
 	}
 	return &Query{
-		Mode:        structs.GetCheckMode(c),
-		Type:        c.Type,
-		Timeout:     c.Timeout,
-		AddressMode: c.AddressMode,
-		PortLabel:   c.PortLabel,
-		Protocol:    protocol,
-		Path:        c.Path,
-		Method:      c.Method,
-		Headers:     maps.Clone(c.Header),
-		Body:        c.Body,
+		Mode:          structs.GetCheckMode(c),
+		Type:          c.Type,
+		Timeout:       c.Timeout,
+		AddressMode:   c.AddressMode,
+		PortLabel:     c.PortLabel,
+		Protocol:      protocol,
+		Path:          c.Path,
+		Method:        c.Method,
+		Headers:       maps.Clone(c.Header),
+		Body:          c.Body,
+		TLSSkipVerify: c.TLSSkipVerify,
 	}
 }
 
@@ -42,11 +43,12 @@ type Query struct {
 	AddressMode string // host, driver, or alloc
 	PortLabel   string // label or value
 
-	Protocol string      // http checks only (http or https)
-	Path     string      // http checks only
-	Method   string      // http checks only
-	Headers  http.Header // http checks only
-	Body     string      // http checks only
+	Protocol      string      // http checks only (http or https)
+	Path          string      // http checks only
+	Method        string      // http checks only
+	Headers       http.Header // http checks only
+	Body          string      // http checks only
+	TLSSkipVerify bool        // http checks only, https protocol
 }
 
 // A QueryContext contains allocation and service parameters necessary for
@@ -87,17 +89,6 @@ func Stub(
 // AllocationResults is a view of the check_id -> latest result for group and task
 // checks in an allocation.
 type AllocationResults map[structs.CheckID]*structs.CheckQueryResult
-
-// diff returns the set of IDs in ids that are not in m.
-func (m AllocationResults) diff(ids []structs.CheckID) []structs.CheckID {
-	var missing []structs.CheckID
-	for _, id := range ids {
-		if _, exists := m[id]; !exists {
-			missing = append(missing, id)
-		}
-	}
-	return missing
-}
 
 // ClientResults is a holistic view of alloc_id -> check_id -> latest result
 // group and task checks across all allocations on a client.

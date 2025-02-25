@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package subproc
 
@@ -9,18 +9,22 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 )
 
 const (
 	// ExitSuccess indicates the subprocess completed successfully.
-	ExitSuccess = iota
+	ExitSuccess = 0
 
 	// ExitFailure indicates the subprocess terminated unsuccessfully.
-	ExitFailure
+	ExitFailure = 1
 
 	// ExitTimeout indicates the subprocess timed out before completion.
-	ExitTimeout
+	ExitTimeout = 2
+
+	// ExitNotRunnable indicates a command cannot be run.
+	ExitNotRunnable = 127 // bash-ism
 )
 
 // MainFunc is the function that runs for this sub-process.
@@ -45,12 +49,15 @@ func Print(format string, args ...any) {
 //
 // r should be a buffer containing output (typically combined stdin + stdout)
 // f should be an HCLogger Print method (e.g. log.Debug)
-func Log(r io.Reader, f func(msg string, args ...any)) {
+func Log(r io.Reader, f func(msg string, args ...any)) string {
 	scanner := bufio.NewScanner(r)
+	lines := ""
 	for scanner.Scan() {
 		line := scanner.Text()
+		lines += line + "\n"
 		f("sub-process", "OUTPUT", line)
 	}
+	return strings.TrimSpace(lines)
 }
 
 // Context creates a context setup with the given timeout.

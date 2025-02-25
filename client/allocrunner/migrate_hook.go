@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package allocrunner
 
@@ -15,12 +15,16 @@ import (
 // diskMigrationHook migrates ephemeral disk volumes. Depends on alloc dir
 // being built but must be run before anything else manipulates the alloc dir.
 type diskMigrationHook struct {
-	allocDir     *allocdir.AllocDir
+	allocDir     allocdir.Interface
 	allocWatcher config.PrevAllocMigrator
 	logger       log.Logger
 }
 
-func newDiskMigrationHook(logger log.Logger, allocWatcher config.PrevAllocMigrator, allocDir *allocdir.AllocDir) *diskMigrationHook {
+func newDiskMigrationHook(
+	logger log.Logger,
+	allocWatcher config.PrevAllocMigrator,
+	allocDir allocdir.Interface,
+) *diskMigrationHook {
 	h := &diskMigrationHook{
 		allocDir:     allocDir,
 		allocWatcher: allocWatcher,

@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package state
 
@@ -390,6 +390,62 @@ func TestEventsFromChanges_NodeUpdateStatusRequest(t *testing.T) {
 	require.Equal(t, structs.NodeStatusDown, event.Node.Status)
 }
 
+func TestEventsFromChanges_NodePoolUpsertRequestType(t *testing.T) {
+	ci.Parallel(t)
+	s := TestStateStoreCfg(t, TestStateStorePublisher(t))
+	defer s.StopEventBroker()
+
+	// Create test node pool.
+	pool := mock.NodePool()
+	err := s.UpsertNodePools(structs.MsgTypeTestSetup, 1000, []*structs.NodePool{pool})
+	must.NoError(t, err)
+
+	// Update test node pool.
+	updated := pool.Copy()
+	updated.Meta["updated"] = "true"
+	err = s.UpsertNodePools(structs.NodePoolUpsertRequestType, 1001, []*structs.NodePool{updated})
+	must.NoError(t, err)
+
+	// Wait and verify update event.
+	events := WaitForEvents(t, s, 1001, 1, 1*time.Second)
+	must.Len(t, 1, events)
+
+	e := events[0]
+	must.Eq(t, structs.TopicNodePool, e.Topic)
+	must.Eq(t, structs.TypeNodePoolUpserted, e.Type)
+	must.Eq(t, pool.Name, e.Key)
+
+	payload := e.Payload.(*structs.NodePoolEvent)
+	must.Eq(t, updated, payload.NodePool)
+}
+
+func TestEventsFromChanges_NodePoolDeleteRequestType(t *testing.T) {
+	ci.Parallel(t)
+	s := TestStateStoreCfg(t, TestStateStorePublisher(t))
+	defer s.StopEventBroker()
+
+	// Create test node pool.
+	pool := mock.NodePool()
+	err := s.UpsertNodePools(structs.MsgTypeTestSetup, 1000, []*structs.NodePool{pool})
+	must.NoError(t, err)
+
+	// Delete test node pool.
+	err = s.DeleteNodePools(structs.NodePoolDeleteRequestType, 1001, []string{pool.Name})
+	must.NoError(t, err)
+
+	// Wait and verify delete event.
+	events := WaitForEvents(t, s, 1001, 1, 1*time.Second)
+	must.Len(t, 1, events)
+
+	e := events[0]
+	must.Eq(t, structs.TopicNodePool, e.Topic)
+	must.Eq(t, structs.TypeNodePoolDeleted, e.Type)
+	must.Eq(t, pool.Name, e.Key)
+
+	payload := e.Payload.(*structs.NodePoolEvent)
+	must.Eq(t, pool, payload.NodePool)
+}
+
 func TestEventsFromChanges_EvalUpdateRequestType(t *testing.T) {
 	ci.Parallel(t)
 	s := TestStateStoreCfg(t, TestStateStorePublisher(t))
@@ -670,7 +726,7 @@ func TestEventsFromChanges_WithDeletion(t *testing.T) {
 	event := eventsFromChanges(nil, changes)
 	require.NotNil(t, event)
 
-	require.Len(t, event.Events, 1)
+	require.Len(t, event.Events, 2)
 }
 
 func TestEventsFromChanges_WithNodeDeregistration(t *testing.T) {
@@ -1157,6 +1213,126 @@ func Test_eventsFromChanges_ACLBindingRule(t *testing.T) {
 	must.Eq(t, uint64(20), receivedDeleteChange.Events[0].Index)
 
 	must.Eq(t, bindingRule, receivedDeleteChange.Events[0].Payload.(*structs.ACLBindingRuleEvent).ACLBindingRule)
+}
+
+func TestEvents_HostVolumes(t *testing.T) {
+	ci.Parallel(t)
+	store := TestStateStoreCfg(t, TestStateStorePublisher(t))
+	defer store.StopEventBroker()
+
+	index, err := store.LatestIndex()
+	must.NoError(t, err)
+
+	node := mock.Node()
+	index++
+	must.NoError(t, store.UpsertNode(structs.NodeRegisterRequestType, index, node, NodeUpsertWithNodePool))
+
+	vol := mock.HostVolume()
+	vol.NodeID = node.ID
+	index++
+	must.NoError(t, store.UpsertHostVolume(index, vol))
+
+	node = node.Copy()
+	node.HostVolumes = map[string]*structs.ClientHostVolumeConfig{vol.Name: {
+		Name: vol.Name,
+		Path: "/var/nomad/alloc_mounts" + uuid.Generate(),
+	}}
+	index++
+	must.NoError(t, store.UpsertNode(structs.NodeRegisterRequestType, index, node, NodeUpsertWithNodePool))
+
+	index++
+	must.NoError(t, store.DeleteHostVolume(index, vol.Namespace, vol.ID))
+
+	events := WaitForEvents(t, store, 0, 5, 1*time.Second)
+	must.Len(t, 5, events)
+	must.Eq(t, "Node", events[0].Topic)
+	must.Eq(t, "NodeRegistration", events[0].Type)
+	must.Eq(t, "HostVolume", events[1].Topic)
+	must.Eq(t, "HostVolumeRegistered", events[1].Type)
+	must.Eq(t, "Node", events[2].Topic)
+	must.Eq(t, "NodeRegistration", events[2].Type)
+	must.Eq(t, "HostVolume", events[3].Topic)
+	must.Eq(t, "NodeRegistration", events[3].Type)
+	must.Eq(t, "HostVolume", events[4].Topic)
+	must.Eq(t, "HostVolumeDeleted", events[4].Type)
+}
+
+func TestEvents_CSIVolumes(t *testing.T) {
+	ci.Parallel(t)
+	store := TestStateStoreCfg(t, TestStateStorePublisher(t))
+	defer store.StopEventBroker()
+
+	index, err := store.LatestIndex()
+	must.NoError(t, err)
+
+	plugin := mock.CSIPlugin()
+	vol := mock.CSIVolume(plugin)
+
+	index++
+	must.NoError(t, store.UpsertCSIVolume(index, []*structs.CSIVolume{vol}))
+
+	alloc := mock.Alloc()
+	index++
+	store.UpsertAllocs(structs.MsgTypeTestSetup, index, []*structs.Allocation{alloc})
+
+	claim := &structs.CSIVolumeClaim{
+		AllocationID:   alloc.ID,
+		NodeID:         uuid.Generate(),
+		Mode:           structs.CSIVolumeClaimGC,
+		AccessMode:     structs.CSIVolumeAccessModeSingleNodeWriter,
+		AttachmentMode: structs.CSIVolumeAttachmentModeFilesystem,
+		State:          structs.CSIVolumeClaimStateReadyToFree,
+	}
+	index++
+	must.NoError(t, store.CSIVolumeClaim(index, time.Now().UnixNano(), vol.Namespace, vol.ID, claim))
+
+	index++
+	must.NoError(t, store.CSIVolumeDeregister(index, vol.Namespace, []string{vol.ID}, false))
+
+	events := WaitForEvents(t, store, 0, 3, 1*time.Second)
+	must.Len(t, 3, events)
+	must.Eq(t, "CSIVolume", events[0].Topic)
+	must.Eq(t, "CSIVolumeRegistered", events[0].Type)
+	must.Eq(t, "CSIVolume", events[1].Topic)
+	must.Eq(t, "CSIVolumeClaim", events[1].Type)
+	must.Eq(t, "CSIVolume", events[2].Topic)
+	must.Eq(t, "CSIVolumeDeregistered", events[2].Type)
+
+}
+
+func TestEvents_CSIPlugins(t *testing.T) {
+	ci.Parallel(t)
+	store := TestStateStoreCfg(t, TestStateStorePublisher(t))
+	defer store.StopEventBroker()
+
+	index, err := store.LatestIndex()
+	must.NoError(t, err)
+
+	node := mock.Node()
+	plugin := mock.CSIPlugin()
+
+	index++
+	must.NoError(t, store.UpsertNode(structs.NodeRegisterRequestType, index, node))
+
+	node = node.Copy()
+	node.CSINodePlugins = map[string]*structs.CSIInfo{
+		plugin.ID: {
+			PluginID:   plugin.ID,
+			Healthy:    true,
+			UpdateTime: time.Now(),
+		},
+	}
+	index++
+	must.NoError(t, store.UpsertNode(structs.NodeRegisterRequestType, index, node))
+
+	events := WaitForEvents(t, store, 0, 3, 1*time.Second)
+	must.Len(t, 3, events)
+	must.Eq(t, "Node", events[0].Topic)
+	must.Eq(t, "NodeRegistration", events[0].Type)
+	must.Eq(t, "Node", events[1].Topic)
+	must.Eq(t, "NodeRegistration", events[1].Type)
+	must.Eq(t, "CSIPlugin", events[2].Topic)
+	must.Eq(t, "NodeRegistration", events[2].Type)
 }
 
 func requireNodeRegistrationEventEqual(t *testing.T, want, got structs.Event) {

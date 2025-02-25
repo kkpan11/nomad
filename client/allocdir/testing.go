@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package allocdir
 
@@ -18,7 +18,7 @@ func TestAllocDir(t testing.T, l hclog.Logger, prefix, id string) (*AllocDir, fu
 		t.Fatalf("Couldn't create temp dir: %v", err)
 	}
 
-	allocDir := NewAllocDir(l, dir, id)
+	allocDir := NewAllocDir(l, dir, dir, id)
 
 	cleanup := func() {
 		if err := os.RemoveAll(dir); err != nil {

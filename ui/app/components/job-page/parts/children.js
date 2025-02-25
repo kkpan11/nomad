@@ -1,6 +1,6 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 import Component from '@ember/component';
@@ -31,9 +31,9 @@ export default class Children extends Component.extend(Sortable) {
     return this.get('job.taskGroups') || [];
   }
 
-  @computed('job.children.[]')
+  @computed('jobs.[]')
   get children() {
-    return this.get('job.children') || [];
+    return this.jobs || [];
   }
 
   @alias('children') listToSort;

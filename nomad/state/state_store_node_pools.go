@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package state
 
@@ -24,7 +24,7 @@ func (s *StateStore) nodePoolInit() error {
 	}
 
 	return s.UpsertNodePools(
-		structs.NodePoolUpsertRequestType,
+		structs.SystemInitializationType,
 		1,
 		[]*structs.NodePool{allNodePool, defaultNodePool},
 	)
@@ -92,6 +92,12 @@ func (s *StateStore) NodePoolsByNamePrefix(ws memdb.WatchSet, namePrefix string,
 
 	ws.Add(iter.WatchCh())
 	return iter, nil
+}
+
+// nodePoolExists returs true if a node pool with the give name exists.
+func (s *StateStore) nodePoolExists(txn *txn, pool string) (bool, error) {
+	existing, err := txn.First(TableNodePools, "id", pool)
+	return existing != nil, err
 }
 
 // UpsertNodePools inserts or updates the given set of node pools.

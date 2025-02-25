@@ -1,6 +1,6 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 import { next } from '@ember/runloop';
@@ -25,6 +25,7 @@ module('Unit | Adapter | Volume', function (hooks) {
     this.initializeUI = async () => {
       this.server.create('namespace');
       this.server.create('namespace', { id: 'some-namespace' });
+      this.server.create('node-pool');
       this.server.create('node');
       this.server.create('job', { id: 'job-1', namespaceId: 'default' });
       this.server.create('csi-plugin', 2);
@@ -86,9 +87,7 @@ module('Unit | Adapter | Volume', function (hooks) {
     await settled();
 
     assert.deepEqual(pretender.handledRequests.mapBy('url'), [
-      `/v1/volume/${encodeURIComponent(
-        volumeName
-      )}?namespace=${volumeNamespace}`,
+      `/v1/volume/${volumeName}?namespace=${volumeNamespace}`,
     ]);
   });
 

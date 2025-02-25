@@ -1,6 +1,6 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 import { getOwner } from '@ember/application';
@@ -72,7 +72,8 @@ export default class EvaluationsController extends Controller {
       e instanceof MouseEvent ||
       (e instanceof KeyboardEvent &&
         (e.code === 'Enter' || e.code === 'Space')) ||
-      !e
+      !e ||
+      e === 'keynav'
     ) {
       this.statechart.send('LOAD_EVALUATION', { evaluation });
     }

@@ -1,5 +1,5 @@
 # Copyright (c) HashiCorp, Inc.
-# SPDX-License-Identifier: MPL-2.0
+# SPDX-License-Identifier: BUSL-1.1
 
 job "identity" {
   datacenters = ["dc1"]
@@ -82,6 +82,27 @@ job "identity" {
 
         #HACK(schmichael) without the ending `sleep 2` we seem to sometimes miss logs :(
         args = ["-c", "wc -c < secrets/nomad_token; env | grep NOMAD_TOKEN; echo done; sleep 2"]
+      }
+      resources {
+        cpu    = 16
+        memory = 32
+        disk   = 64
+      }
+    }
+
+    task "filepath" {
+
+      identity {
+        file     = true
+        filepath = "local/nomad_token"
+      }
+
+      driver = "docker"
+      config {
+        image = "bash:5"
+
+        #HACK without the ending `sleep 2` we seem to sometimes miss logs :(
+        args = ["-c", "wc -c < local/nomad_token; env | grep NOMAD_TOKEN; echo done; sleep 2"]
       }
       resources {
         cpu    = 16

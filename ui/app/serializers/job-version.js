@@ -1,6 +1,6 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 import { assign } from '@ember/polyfills';
@@ -12,6 +12,13 @@ export default class JobVersionSerializer extends ApplicationSerializer {
   attrs = {
     number: 'Version',
   };
+
+  normalize(typeHash, hash) {
+    if (hash.TaggedVersion) {
+      hash.TaggedVersion.VersionNumber = hash.Version;
+    }
+    return super.normalize(typeHash, hash);
+  }
 
   normalizeFindHasManyResponse(store, modelClass, hash, id, requestType) {
     const zippedVersions = hash.Versions.map((version, index) =>

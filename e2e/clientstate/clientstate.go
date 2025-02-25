@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package clientstate
 
@@ -336,7 +336,7 @@ func (tc *ClientStateTC) TestClientState_KillDuringRestart(f *framework.F) {
 				return false, err
 			}
 			resp.Body.Close()
-			return resp.StatusCode == 200, fmt.Errorf("%d != 200", resp.StatusCode)
+			return resp.StatusCode == http.StatusOK, fmt.Errorf("%d != 200", resp.StatusCode)
 		}, func(err error) {
 			f.NoError(err)
 		})

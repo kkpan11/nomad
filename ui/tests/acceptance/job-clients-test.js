@@ -1,6 +1,6 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 /* eslint-disable qunit/require-expect */
@@ -43,6 +43,7 @@ module('Acceptance | job clients', function (hooks) {
       },
     });
 
+    server.createList('node-pool', 5);
     clients = server.createList('node', 12, {
       datacenter: 'dc1',
       status: 'ready',

@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package command
 
@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	"github.com/hashicorp/nomad/ci"
-	"github.com/stretchr/testify/assert"
+	"github.com/shoenig/test/must"
 )
 
 func Test_formatScalingPolicyTarget(t *testing.T) {
@@ -49,7 +49,7 @@ func Test_formatScalingPolicyTarget(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			actualOutput := formatScalingPolicyTarget(tc.inputMap)
-			assert.Equal(t, tc.expectedOutput, actualOutput, tc.name)
+			must.Eq(t, tc.expectedOutput, actualOutput)
 		})
 	}
 }
