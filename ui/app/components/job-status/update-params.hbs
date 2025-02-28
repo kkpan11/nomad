@@ -1,13 +1,13 @@
 {{!
   Copyright (c) HashiCorp, Inc.
-  SPDX-License-Identifier: MPL-2.0
+  SPDX-License-Identifier: BUSL-1.1
 ~}}
 
 <Trigger @onError={{action this.onError}} @do={{this.fetchJobDefinition}} as |trigger|>
   {{did-insert trigger.fns.do}}
 
   <div class="update-parameters">
-    <h4 class="title is-5">Update Params</h4>
+    <h4 class="title is-4">Update Params</h4>
     <code>
 
       {{#if (and trigger.data.isSuccess (not trigger.data.isError))}}

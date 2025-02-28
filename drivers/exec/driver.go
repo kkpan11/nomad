@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package exec
 
@@ -14,15 +14,18 @@ import (
 
 	"github.com/hashicorp/consul-template/signals"
 	hclog "github.com/hashicorp/go-hclog"
-	"github.com/hashicorp/nomad/client/lib/cgutil"
+	"github.com/hashicorp/nomad/client/lib/cgroupslib"
+	"github.com/hashicorp/nomad/client/lib/cpustats"
 	"github.com/hashicorp/nomad/drivers/shared/capabilities"
 	"github.com/hashicorp/nomad/drivers/shared/eventer"
 	"github.com/hashicorp/nomad/drivers/shared/executor"
 	"github.com/hashicorp/nomad/drivers/shared/resolvconf"
+	"github.com/hashicorp/nomad/drivers/shared/validators"
 	"github.com/hashicorp/nomad/helper/pluginutils/loader"
 	"github.com/hashicorp/nomad/helper/pointer"
 	"github.com/hashicorp/nomad/plugins/base"
 	"github.com/hashicorp/nomad/plugins/drivers"
+	"github.com/hashicorp/nomad/plugins/drivers/fsisolation"
 	"github.com/hashicorp/nomad/plugins/drivers/utils"
 	"github.com/hashicorp/nomad/plugins/shared/hclspec"
 	pstructs "github.com/hashicorp/nomad/plugins/shared/structs"
@@ -81,6 +84,8 @@ var (
 			hclspec.NewAttr("allow_caps", "list(string)", false),
 			hclspec.NewLiteral(capabilities.HCLSpecLiteral),
 		),
+		"denied_host_uids": hclspec.NewAttr("denied_host_uids", "string", false),
+		"denied_host_gids": hclspec.NewAttr("denied_host_gids", "string", false),
 	})
 
 	// taskConfigSpec is the hcl specification for the driver config section of
@@ -92,6 +97,7 @@ var (
 		"ipc_mode": hclspec.NewAttr("ipc_mode", "string", false),
 		"cap_add":  hclspec.NewAttr("cap_add", "list(string)", false),
 		"cap_drop": hclspec.NewAttr("cap_drop", "list(string)", false),
+		"work_dir": hclspec.NewAttr("work_dir", "string", false),
 	})
 
 	// driverCapabilities represents the RPC response for what features are
@@ -99,7 +105,7 @@ var (
 	driverCapabilities = &drivers.Capabilities{
 		SendSignals: true,
 		Exec:        true,
-		FSIsolation: drivers.FSIsolationChroot,
+		FSIsolation: fsisolation.Chroot,
 		NetIsolationModes: []drivers.NetIsolationMode{
 			drivers.NetIsolationModeHost,
 			drivers.NetIsolationModeGroup,
@@ -135,6 +141,11 @@ type Driver struct {
 	// whether it has been successful
 	fingerprintSuccess *bool
 	fingerprintLock    sync.Mutex
+
+	// compute contains cpu compute information
+	compute cpustats.Compute
+
+	userIDValidator UserIDValidator
 }
 
 // Config is the driver configuration set by the SetConfig RPC call
@@ -154,6 +165,9 @@ type Config struct {
 	// AllowCaps configures which Linux Capabilities are enabled for tasks
 	// running on this node.
 	AllowCaps []string `codec:"allow_caps"`
+
+	DeniedHostUids string `codec:"denied_host_uids"`
+	DeniedHostGids string `codec:"denied_host_gids"`
 }
 
 func (c *Config) validate() error {
@@ -198,6 +212,9 @@ type TaskConfig struct {
 
 	// CapDrop is a set of linux capabilities to disable.
 	CapDrop []string `codec:"cap_drop"`
+
+	// WorkDir is the working directory inside the chroot
+	WorkDir string `codec:"work_dir"`
 }
 
 func (tc *TaskConfig) validate() error {
@@ -218,9 +235,14 @@ func (tc *TaskConfig) validate() error {
 	if !badAdds.Empty() {
 		return fmt.Errorf("cap_add configured with capabilities not supported by system: %s", badAdds)
 	}
+
 	badDrops := supported.Difference(capabilities.New(tc.CapDrop))
 	if !badDrops.Empty() {
 		return fmt.Errorf("cap_drop configured with capabilities not supported by system: %s", badDrops)
+	}
+
+	if tc.WorkDir != "" && !filepath.IsAbs(tc.WorkDir) {
+		return fmt.Errorf("work_dir must be absolute but got relative path %q", tc.WorkDir)
 	}
 
 	return nil
@@ -234,6 +256,10 @@ type TaskState struct {
 	TaskConfig     *drivers.TaskConfig
 	Pid            int
 	StartedAt      time.Time
+}
+
+type UserIDValidator interface {
+	HasValidIDs(userName string) error
 }
 
 // NewExecDriver returns a new DrivePlugin implementation
@@ -280,18 +306,31 @@ func (d *Driver) ConfigSchema() (*hclspec.Spec, error) {
 func (d *Driver) SetConfig(cfg *base.Config) error {
 	// unpack, validate, and set agent plugin config
 	var config Config
+
 	if len(cfg.PluginConfig) != 0 {
 		if err := base.MsgPackDecode(cfg.PluginConfig, &config); err != nil {
 			return err
 		}
 	}
+
 	if err := config.validate(); err != nil {
 		return err
 	}
+
+	if d.userIDValidator == nil {
+		idValidator, err := validators.NewValidator(d.logger, config.DeniedHostUids, config.DeniedHostGids)
+		if err != nil {
+			return fmt.Errorf("unable to start validator: %w", err)
+		}
+
+		d.userIDValidator = idValidator
+	}
+
 	d.config = config
 
 	if cfg != nil && cfg.AgentConfig != nil {
 		d.nomadConfig = cfg.AgentConfig.Driver
+		d.compute = cfg.AgentConfig.Compute()
 	}
 	return nil
 }
@@ -350,20 +389,9 @@ func (d *Driver) buildFingerprint() *drivers.Fingerprint {
 		return fp
 	}
 
-	mount, err := cgutil.FindCgroupMountpointDir()
-	if err != nil {
+	if cgroupslib.GetMode() == cgroupslib.OFF {
 		fp.Health = drivers.HealthStateUnhealthy
 		fp.HealthDescription = drivers.NoCgroupMountMessage
-		if d.fingerprintSuccessful() {
-			d.logger.Warn(fp.HealthDescription, "error", err)
-		}
-		d.setFingerprintFailure()
-		return fp
-	}
-
-	if mount == "" {
-		fp.Health = drivers.HealthStateUnhealthy
-		fp.HealthDescription = drivers.CgroupMountEmpty
 		d.setFingerprintFailure()
 		return fp
 	}
@@ -401,8 +429,11 @@ func (d *Driver) RecoverTask(handle *drivers.TaskHandle) error {
 		return fmt.Errorf("failed to build ReattachConfig from task state: %v", err)
 	}
 
-	exec, pluginClient, err := executor.ReattachToExecutor(plugRC,
-		d.logger.With("task_name", handle.Config.Name, "alloc_id", handle.Config.AllocID))
+	exec, pluginClient, err := executor.ReattachToExecutor(
+		plugRC,
+		d.logger.With("task_name", handle.Config.Name, "alloc_id", handle.Config.AllocID),
+		d.compute,
+	)
 	if err != nil {
 		d.logger.Error("failed to reattach to executor", "error", err, "task_id", handle.Config.ID)
 		return fmt.Errorf("failed to reattach to executor: %v", err)
@@ -425,7 +456,7 @@ func (d *Driver) RecoverTask(handle *drivers.TaskHandle) error {
 	return nil
 }
 
-func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drivers.DriverNetwork, error) {
+func (d *Driver) StartTask(cfg *drivers.TaskConfig) (handle *drivers.TaskHandle, network *drivers.DriverNetwork, err error) {
 	if _, ok := d.tasks.Get(cfg.ID); ok {
 		return nil, nil, fmt.Errorf("task with ID %q already started", cfg.ID)
 	}
@@ -439,8 +470,18 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drive
 		return nil, nil, fmt.Errorf("failed driver config validation: %v", err)
 	}
 
+	if cfg.User == "" {
+		cfg.User = "nobody"
+	}
+
+	d.logger.Debug("setting up user", "user", cfg.User)
+
+	if err := d.userIDValidator.HasValidIDs(cfg.User); err != nil {
+		return nil, nil, fmt.Errorf("failed host user validation: %v", err)
+	}
+
 	d.logger.Info("starting task", "driver_cfg", hclog.Fmt("%+v", driverConfig))
-	handle := drivers.NewTaskHandle(taskHandleVersion)
+	handle = drivers.NewTaskHandle(taskHandleVersion)
 	handle.Config = cfg
 
 	pluginLogFile := filepath.Join(cfg.TaskDir().Dir, "executor.out")
@@ -448,20 +489,10 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drive
 		LogFile:     pluginLogFile,
 		LogLevel:    "debug",
 		FSIsolation: true,
-	}
-
-	exec, pluginClient, err := executor.CreateExecutor(
-		d.logger.With("task_name", handle.Config.Name, "alloc_id", handle.Config.AllocID),
-		d.nomadConfig, executorConfig)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create executor: %v", err)
+		Compute:     d.compute,
 	}
 
 	user := cfg.User
-	if user == "" {
-		user = "nobody"
-	}
-
 	if cfg.DNS != nil {
 		dnsMount, err := resolvconf.GenerateDNSMount(cfg.TaskDir().Dir, cfg.DNS)
 		if err != nil {
@@ -478,6 +509,19 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drive
 	}
 	d.logger.Debug("task capabilities", "capabilities", caps)
 
+	exec, pluginClient, err := executor.CreateExecutor(
+		d.logger.With("task_name", handle.Config.Name, "alloc_id", handle.Config.AllocID),
+		d.nomadConfig, executorConfig)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to create executor: %v", err)
+	}
+	// prevent leaking executor in error scenarios
+	defer func() {
+		if err != nil {
+			pluginClient.Kill()
+		}
+	}()
+
 	execCmd := &executor.ExecCommand{
 		Cmd:              driverConfig.Command,
 		Args:             driverConfig.Args,
@@ -487,6 +531,7 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drive
 		NoPivotRoot:      d.config.NoPivotRoot,
 		Resources:        cfg.Resources,
 		TaskDir:          cfg.TaskDir().Dir,
+		WorkDir:          driverConfig.WorkDir,
 		StdoutPath:       cfg.StdoutPath,
 		StderrPath:       cfg.StderrPath,
 		Mounts:           cfg.Mounts,
@@ -499,7 +544,6 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drive
 
 	ps, err := exec.Launch(execCmd)
 	if err != nil {
-		pluginClient.Kill()
 		return nil, nil, fmt.Errorf("failed to launch command with executor: %v", err)
 	}
 
@@ -523,7 +567,6 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drive
 	if err := handle.SetDriverState(&driverState); err != nil {
 		d.logger.Error("failed to start task, error setting driver state", "error", err)
 		_ = exec.Shutdown("", 0)
-		pluginClient.Kill()
 		return nil, nil, fmt.Errorf("failed to set driver state: %v", err)
 	}
 
@@ -554,8 +597,9 @@ func (d *Driver) handleWait(ctx context.Context, handle *taskHandle, ch chan *dr
 		}
 	} else {
 		result = &drivers.ExitResult{
-			ExitCode: ps.ExitCode,
-			Signal:   ps.Signal,
+			ExitCode:  ps.ExitCode,
+			Signal:    ps.Signal,
+			OOMKilled: ps.OOMKilled,
 		}
 	}
 
@@ -584,25 +628,6 @@ func (d *Driver) StopTask(taskID string, timeout time.Duration, signal string) e
 	return nil
 }
 
-// resetCgroup will re-create the v2 cgroup for the task after the task has been
-// destroyed by libcontainer. In the case of a task restart we call DestroyTask
-// which removes the cgroup - but we still need it!
-//
-// Ideally the cgroup management would be more unified - and we could do the creation
-// on a task runner pre-start hook, eliminating the need for this hack.
-func (d *Driver) resetCgroup(handle *taskHandle) {
-	if cgutil.UseV2 {
-		if handle.taskConfig.Resources != nil &&
-			handle.taskConfig.Resources.LinuxResources != nil &&
-			handle.taskConfig.Resources.LinuxResources.CpusetCgroupPath != "" {
-			err := os.Mkdir(handle.taskConfig.Resources.LinuxResources.CpusetCgroupPath, 0755)
-			if err != nil {
-				d.logger.Trace("failed to reset cgroup", "path", handle.taskConfig.Resources.LinuxResources.CpusetCgroupPath)
-			}
-		}
-	}
-}
-
 func (d *Driver) DestroyTask(taskID string, force bool) error {
 	handle, ok := d.tasks.Get(taskID)
 	if !ok {
@@ -620,9 +645,6 @@ func (d *Driver) DestroyTask(taskID string, force bool) error {
 
 		handle.pluginClient.Kill()
 	}
-
-	// workaround for the case where DestroyTask was issued on task restart
-	d.resetCgroup(handle)
 
 	d.tasks.Delete(taskID)
 	return nil

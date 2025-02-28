@@ -1,6 +1,6 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 import Controller from '@ember/controller';
@@ -34,6 +34,11 @@ export default class JobsRunTemplatesNewController extends Controller {
       .find(
         (v) => v.path === templateName && v.namespace === this.templateNamespace
       );
+  }
+
+  get hasInvalidName() {
+    let pathNameRegex = new RegExp('^[a-zA-Z0-9-_~/]{1,128}$');
+    return !pathNameRegex.test(this.templateName);
   }
 
   @action
@@ -74,9 +79,19 @@ export default class JobsRunTemplatesNewController extends Controller {
 
       this.router.transitionTo('jobs.run.templates');
     } catch (e) {
+      let errorMessage =
+        'An unexpected error occurred when saving your Job template.';
+      console.log('caught', e);
+      if (e.errors && e.errors.length > 0) {
+        const nameInvalidError = e.errors.find((err) => err.status === 400);
+        if (nameInvalidError) {
+          errorMessage = nameInvalidError.detail;
+        }
+      }
+
       this.notifications.add({
         title: 'Job template cannot be saved.',
-        message: e,
+        message: errorMessage,
         color: 'critical',
       });
     }

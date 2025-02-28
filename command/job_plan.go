@@ -1,11 +1,10 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package command
 
 import (
 	"fmt"
-	"os"
 	"sort"
 	"strings"
 	"time"
@@ -67,10 +66,6 @@ Alias: nomad plan
     * 1: Allocations created or destroyed.
     * 255: Error determining plan results.
 
-  The plan command will set the vault_token of the job based on the following
-  precedence, going from highest to lowest: the -vault-token flag, the
-  $VAULT_TOKEN environment variable and finally the value in the job file.
-
   When ACLs are enabled, this command requires a token with the 'submit-job'
   capability for the job's namespace.
 
@@ -89,28 +84,13 @@ Plan Options:
     from "nomad job inspect" or "nomad run -output", the value of the field is
     used as the job.
 
-  -hcl1
-    Parses the job file as HCLv1. Takes precedence over "-hcl2-strict".
-
   -hcl2-strict
     Whether an error should be produced from the HCL2 parser where a variable
     has been supplied which is not defined within the root variables. Defaults
-    to true, but ignored if "-hcl1" is also defined.
+    to true.
 
   -policy-override
     Sets the flag to force override any soft mandatory Sentinel policies.
-
-  -vault-token
-    Used to validate if the user submitting the job has permission to run the job
-    according to its Vault policies. A Vault token must be supplied if the vault
-    block allow_unauthenticated is disabled in the Nomad server configuration.
-    If the -vault-token flag is set, the passed Vault token is added to the jobspec
-    before sending to the Nomad servers. This allows passing the Vault token
-    without storing it in the job file. This overrides the token found in the
-    $VAULT_TOKEN environment variable and the vault_token field in the job file.
-    This token is cleared from the job after validating and cannot be used within
-    the job executing environment. Use the vault block when templating in a job
-    with a Vault token.
 
   -vault-namespace
     If set, the passed Vault namespace is stored in the job before sending to the
@@ -139,9 +119,7 @@ func (c *JobPlanCommand) AutocompleteFlags() complete.Flags {
 			"-policy-override": complete.PredictNothing,
 			"-verbose":         complete.PredictNothing,
 			"-json":            complete.PredictNothing,
-			"-hcl1":            complete.PredictNothing,
 			"-hcl2-strict":     complete.PredictNothing,
-			"-vault-token":     complete.PredictAnything,
 			"-vault-namespace": complete.PredictAnything,
 			"-var":             complete.PredictAnything,
 			"-var-file":        complete.PredictFiles("*.var"),
@@ -159,7 +137,7 @@ func (c *JobPlanCommand) AutocompleteArgs() complete.Predictor {
 func (c *JobPlanCommand) Name() string { return "job plan" }
 func (c *JobPlanCommand) Run(args []string) int {
 	var diff, policyOverride, verbose bool
-	var vaultToken, vaultNamespace string
+	var vaultNamespace string
 
 	flagSet := c.Meta.FlagSet(c.Name(), FlagSetClient)
 	flagSet.Usage = func() { c.Ui.Output(c.Help()) }
@@ -167,9 +145,7 @@ func (c *JobPlanCommand) Run(args []string) int {
 	flagSet.BoolVar(&policyOverride, "policy-override", false, "")
 	flagSet.BoolVar(&verbose, "verbose", false, "")
 	flagSet.BoolVar(&c.JobGetter.JSON, "json", false, "")
-	flagSet.BoolVar(&c.JobGetter.HCL1, "hcl1", false, "")
 	flagSet.BoolVar(&c.JobGetter.Strict, "hcl2-strict", true, "")
-	flagSet.StringVar(&vaultToken, "vault-token", "", "")
 	flagSet.StringVar(&vaultNamespace, "vault-namespace", "", "")
 	flagSet.Var(&c.JobGetter.Vars, "var", "")
 	flagSet.Var(&c.JobGetter.VarFiles, "var-file", "")
@@ -184,10 +160,6 @@ func (c *JobPlanCommand) Run(args []string) int {
 		c.Ui.Error("This command takes one argument: <path>")
 		c.Ui.Error(commandErrorText(c))
 		return 255
-	}
-
-	if c.JobGetter.HCL1 {
-		c.JobGetter.Strict = false
 	}
 
 	if err := c.JobGetter.Validate(); err != nil {
@@ -218,17 +190,6 @@ func (c *JobPlanCommand) Run(args []string) int {
 	// Force the namespace to be that of the job.
 	if n := job.Namespace; n != nil {
 		client.SetNamespace(*n)
-	}
-
-	// Parse the Vault token.
-	if vaultToken == "" {
-		// Check the environment variable
-		vaultToken = os.Getenv("VAULT_TOKEN")
-	}
-
-	// Set the vault token.
-	if vaultToken != "" {
-		job.VaultToken = pointer.Of(vaultToken)
 	}
 
 	//  Set the vault namespace.

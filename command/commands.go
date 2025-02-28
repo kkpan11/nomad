@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package command
 
@@ -7,10 +7,10 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/hashicorp/cli"
 	"github.com/hashicorp/nomad/command/agent"
 	"github.com/hashicorp/nomad/version"
 	colorable "github.com/mattn/go-colorable"
-	"github.com/mitchellh/cli"
 )
 
 const (
@@ -235,6 +235,11 @@ func Commands(metaPtr *Meta, agentUi cli.Ui) map[string]cli.CommandFactory {
 				Meta: meta,
 			}, nil
 		},
+		"action": func() (cli.Command, error) {
+			return &ActionCommand{
+				Meta: meta,
+			}, nil
+		},
 		"alloc": func() (cli.Command, error) {
 			return &AllocCommand{
 				Meta: meta,
@@ -247,6 +252,11 @@ func Commands(metaPtr *Meta, agentUi cli.Ui) map[string]cli.CommandFactory {
 		},
 		"alloc signal": func() (cli.Command, error) {
 			return &AllocSignalCommand{
+				Meta: meta,
+			}, nil
+		},
+		"alloc pause": func() (cli.Command, error) {
+			return &AllocPauseCommand{
 				Meta: meta,
 			}, nil
 		},
@@ -413,6 +423,11 @@ func Commands(metaPtr *Meta, agentUi cli.Ui) map[string]cli.CommandFactory {
 				Meta: meta,
 			}, nil
 		},
+		"job action": func() (cli.Command, error) {
+			return &JobActionCommand{
+				Meta: meta,
+			}, nil
+		},
 		"job allocs": func() (cli.Command, error) {
 			return &JobAllocsCommand{
 				Meta: meta,
@@ -503,6 +518,21 @@ func Commands(metaPtr *Meta, agentUi cli.Ui) map[string]cli.CommandFactory {
 		},
 		"job stop": func() (cli.Command, error) {
 			return &JobStopCommand{
+				Meta: meta,
+			}, nil
+		},
+		"job tag": func() (cli.Command, error) {
+			return &JobTagCommand{
+				Meta: meta,
+			}, nil
+		},
+		"job tag apply": func() (cli.Command, error) {
+			return &JobTagApplyCommand{
+				Meta: meta,
+			}, nil
+		},
+		"job tag unset": func() (cli.Command, error) {
+			return &JobTagUnsetCommand{
 				Meta: meta,
 			}, nil
 		},
@@ -636,8 +666,23 @@ func Commands(metaPtr *Meta, agentUi cli.Ui) map[string]cli.CommandFactory {
 				Meta: meta,
 			}, nil
 		},
+		"node pool init": func() (cli.Command, error) {
+			return &NodePoolInitCommand{
+				Meta: meta,
+			}, nil
+		},
+		"node pool jobs": func() (cli.Command, error) {
+			return &NodePoolJobsCommand{
+				Meta: meta,
+			}, nil
+		},
 		"node pool list": func() (cli.Command, error) {
 			return &NodePoolListCommand{
+				Meta: meta,
+			}, nil
+		},
+		"node pool nodes": func() (cli.Command, error) {
+			return &NodePoolNodesCommand{
 				Meta: meta,
 			}, nil
 		},
@@ -670,6 +715,11 @@ func Commands(metaPtr *Meta, agentUi cli.Ui) map[string]cli.CommandFactory {
 				Meta: meta,
 			}, nil
 		},
+		"operator autopilot health": func() (cli.Command, error) {
+			return &OperatorAutopilotHealthCommand{
+				Meta: meta,
+			}, nil
+		},
 
 		"operator client-state": func() (cli.Command, error) {
 			return &OperatorClientStateCommand{
@@ -678,6 +728,11 @@ func Commands(metaPtr *Meta, agentUi cli.Ui) map[string]cli.CommandFactory {
 		},
 		"operator debug": func() (cli.Command, error) {
 			return &OperatorDebugCommand{
+				Meta: meta,
+			}, nil
+		},
+		"operator gossip": func() (cli.Command, error) {
+			return &OperatorGossipCommand{
 				Meta: meta,
 			}, nil
 		},
@@ -734,6 +789,11 @@ func Commands(metaPtr *Meta, agentUi cli.Ui) map[string]cli.CommandFactory {
 				Meta: meta,
 			}, nil
 		},
+		"operator raft transfer-leadership": func() (cli.Command, error) {
+			return &OperatorRaftTransferLeadershipCommand{
+				Meta: meta,
+			}, nil
+		},
 		"operator raft info": func() (cli.Command, error) {
 			return &OperatorRaftInfoCommand{
 				Meta: meta,
@@ -761,6 +821,11 @@ func Commands(metaPtr *Meta, agentUi cli.Ui) map[string]cli.CommandFactory {
 		},
 		"operator scheduler set-config": func() (cli.Command, error) {
 			return &OperatorSchedulerSetConfig{
+				Meta: meta,
+			}, nil
+		},
+		"operator root": func() (cli.Command, error) {
+			return &OperatorRootCommand{
 				Meta: meta,
 			}, nil
 		},
@@ -806,6 +871,11 @@ func Commands(metaPtr *Meta, agentUi cli.Ui) map[string]cli.CommandFactory {
 		},
 		"operator snapshot restore": func() (cli.Command, error) {
 			return &OperatorSnapshotRestoreCommand{
+				Meta: meta,
+			}, nil
+		},
+		"operator snapshot redact": func() (cli.Command, error) {
+			return &OperatorSnapshotRedactCommand{
 				Meta: meta,
 			}, nil
 		},
@@ -1006,6 +1076,21 @@ func Commands(metaPtr *Meta, agentUi cli.Ui) map[string]cli.CommandFactory {
 				Meta: meta,
 			}, nil
 		},
+		"setup": func() (cli.Command, error) {
+			return &SetupCommand{
+				Meta: meta,
+			}, nil
+		},
+		"setup consul": func() (cli.Command, error) {
+			return &SetupConsulCommand{
+				Meta: meta,
+			}, nil
+		},
+		"setup vault": func() (cli.Command, error) {
+			return &SetupVaultCommand{
+				Meta: meta,
+			}, nil
+		},
 		"status": func() (cli.Command, error) {
 			return &StatusCommand{
 				Meta: meta,
@@ -1106,6 +1191,13 @@ func Commands(metaPtr *Meta, agentUi cli.Ui) map[string]cli.CommandFactory {
 				Meta: meta,
 			}, nil
 		},
+		"var lock": func() (cli.Command, error) {
+			return &VarLockCommand{
+				varPutCommand: &VarPutCommand{
+					Meta: meta,
+				},
+			}, nil
+		},
 		"var get": func() (cli.Command, error) {
 			return &VarGetCommand{
 				Meta: meta,
@@ -1174,6 +1266,21 @@ func Commands(metaPtr *Meta, agentUi cli.Ui) map[string]cli.CommandFactory {
 		},
 		"volume snapshot list": func() (cli.Command, error) {
 			return &VolumeSnapshotListCommand{
+				Meta: meta,
+			}, nil
+		},
+		"volume claim": func() (cli.Command, error) {
+			return &VolumeClaimCommand{
+				Meta: meta,
+			}, nil
+		},
+		"volume claim list": func() (cli.Command, error) {
+			return &VolumeClaimListCommand{
+				Meta: meta,
+			}, nil
+		},
+		"volume claim delete": func() (cli.Command, error) {
+			return &VolumeClaimDeleteCommand{
 				Meta: meta,
 			}, nil
 		},

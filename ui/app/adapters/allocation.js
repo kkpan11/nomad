@@ -1,6 +1,6 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 import Watchable from './watchable';
@@ -39,6 +39,29 @@ export default class AllocationAdapter extends Watchable {
         `/v1/client/fs/stat/${model.id}?path=${encodeURIComponent(path)}`
       )
       .then(handleFSResponse);
+  }
+
+  // note: TaskName vs Task as key for PUT data differs from restart above
+  forcePause(allocation, taskName) {
+    const prefix = `${this.host || '/'}${this.urlPrefix()}`;
+    const url = `${prefix}/client/allocation/${allocation.id}/pause`;
+    return this.ajax(url, 'PUT', {
+      data: taskName && { Task: taskName, ScheduleState: 'pause' },
+    });
+  }
+  forceRun(allocation, taskName) {
+    const prefix = `${this.host || '/'}${this.urlPrefix()}`;
+    const url = `${prefix}/client/allocation/${allocation.id}/pause`;
+    return this.ajax(url, 'PUT', {
+      data: taskName && { Task: taskName, ScheduleState: 'run' },
+    });
+  }
+  reEnableSchedule(allocation, taskName) {
+    const prefix = `${this.host || '/'}${this.urlPrefix()}`;
+    const url = `${prefix}/client/allocation/${allocation.id}/pause`;
+    return this.ajax(url, 'PUT', {
+      data: taskName && { Task: taskName, ScheduleState: 'scheduled' },
+    });
   }
 
   async check(model) {

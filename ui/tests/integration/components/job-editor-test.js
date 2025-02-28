@@ -1,6 +1,6 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 import { assign } from '@ember/polyfills';
@@ -15,6 +15,7 @@ import jobEditor from 'nomad-ui/tests/pages/components/job-editor';
 import { initialize as fragmentSerializerInitializer } from 'nomad-ui/initializers/fragment-serializer';
 import setupCodeMirror from 'nomad-ui/tests/helpers/codemirror';
 import { componentA11yAudit } from 'nomad-ui/tests/helpers/a11y-audit';
+import percySnapshot from '@percy/ember';
 
 const Editor = create(jobEditor());
 
@@ -31,6 +32,7 @@ module('Integration | Component | job-editor', function (hooks) {
     this.server = startMirage();
 
     // Required for placing allocations (a result of creating jobs)
+    this.server.create('node-pool');
     this.server.create('node');
   });
 
@@ -84,6 +86,7 @@ module('Integration | Component | job-editor', function (hooks) {
       @job={{job}}
       @context={{context}}
       @onSubmit={{onSubmit}}
+      @handleSaveAsTemplate={{handleSaveAsTemplate}}
     />
   `;
 
@@ -91,9 +94,10 @@ module('Integration | Component | job-editor', function (hooks) {
     component.setProperties({
       job,
       onSubmit: sinon.spy(),
+      handleSaveAsTemplate: sinon.spy(),
       context: 'new',
     });
-    await component.render(commonTemplate);
+    await render(commonTemplate);
   };
 
   const planJob = async (spec) => {
@@ -287,8 +291,8 @@ module('Integration | Component | job-editor', function (hooks) {
     await componentA11yAudit(this.element, assert);
   });
 
-  test('when the scheduler dry-run has warnings, the warnings are shown to the user', async function (assert) {
-    assert.expect(4);
+  test('when the scheduler dry-run has errors, the errors are shown to the user', async function (assert) {
+    assert.expect(5);
 
     const spec = jsonJob({ Unschedulable: true });
     const job = await this.store.createRecord('job');
@@ -309,7 +313,27 @@ module('Integration | Component | job-editor', function (hooks) {
       'The scheduler dry-run message includes the warning from send back by the API'
     );
 
+    assert.notOk(
+      Editor.warningMessage.isPresent,
+      'The scheduler dry-run warning block is not present when there is an error but no warnings'
+    );
+
     await componentA11yAudit(this.element, assert);
+
+    await percySnapshot(assert);
+  });
+
+  test('When the scheduler dry-run has warnings, the warnings are shown to the user', async function (assert) {
+    assert.expect(1);
+    const spec = jsonJob({ WithWarnings: true });
+    const job = await this.store.createRecord('job');
+    await renderNewJob(this, job);
+    await planJob(spec);
+    assert.ok(
+      Editor.warningMessage.isPresent,
+      'The scheduler dry-run warning block is shown to the user'
+    );
+    await percySnapshot(assert);
   });
 
   test('when the scheduler dry-run has no warnings, a success message is shown to the user', async function (assert) {

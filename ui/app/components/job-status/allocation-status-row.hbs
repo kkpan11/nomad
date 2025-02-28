@@ -1,9 +1,9 @@
 {{!
   Copyright (c) HashiCorp, Inc.
-  SPDX-License-Identifier: MPL-2.0
+  SPDX-License-Identifier: BUSL-1.1
 ~}}
 
-<div class="allocation-status-row">
+<div class="allocation-status-row  {{if @compact "compact"}}">
   {{#if this.showSummaries}}
     <div class="alloc-status-summaries"
       {{did-insert this.captureElement}}
@@ -16,10 +16,14 @@
               <JobStatus::AllocationStatusBlock
                 @status={{status}}
                 @health={{health}}
+
                 @canary={{canary}}
                 @steady={{@steady}}
                 @count={{allocsByCanary.length}}
-                @width={{compute (action this.calcPerc) allocsByCanary.length}}
+                @width={{compute
+                  (action this.calcPerc) allocsByCanary.length
+                }}
+                @compact={{@compact}}
                 @allocs={{allocsByCanary}} />
             {{/if}}
           {{/each-in}}
@@ -36,34 +40,26 @@
           {{#each-in allocsByHealth as |canary allocsByCanary|}}
             {{#if (gt allocsByCanary.length 0)}}
               {{#each (range 0 allocsByCanary.length) as |i|}}
-                <ConditionalLinkTo
-                  @condition={{not (eq status "unplaced")}}
-                  @route="allocations.allocation"
-                  @model={{get allocsByCanary i}}
-                  @class="represented-allocation {{status}} {{health}} {{canary}}"
-                  @label="View allocation"
-                >
-                  {{#unless @steady}}
-                    {{#if (eq canary "canary")}}
-                      <span class="alloc-canary-indicator" />
-                    {{/if}}
-                    {{#if (eq status "running")}}
-                      <span class="alloc-health-indicator">
-                        {{#if (eq health "healthy")}}
-                          <FlightIcon @name="check" @color="white" />
-                        {{else}}
-                          <FlightIcon @name="running" @color="white" />
-                        {{/if}}
-                      </span>
-                    {{/if}}
-                  {{/unless}}
-                </ConditionalLinkTo>
+                    <JobStatus::IndividualAllocation
+                      @allocation={{get allocsByCanary i}}
+                      @status={{status}}
+                      @health={{health}}
+                      @canary={{canary}}
+                      @steady={{@steady}}
+                    />
               {{/each}}
             {{/if}}
           {{/each-in}}
         {{/each-in}}
       {{/each-in}}
     </div>
+  {{/if}}
+  {{#if @compact}}
+    {{#if (eq @allocationTallyMode "complete")}}
+      {{@completeAllocs}}/{{@groupCountSum}}
+    {{else}}
+      {{@runningAllocs}}/{{@groupCountSum}}
+    {{/if}}
   {{/if}}
 </div>
        

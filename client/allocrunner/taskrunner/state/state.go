@@ -1,11 +1,12 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package state
 
 import (
+	"maps"
+
 	"github.com/hashicorp/nomad/plugins/drivers"
-	"golang.org/x/exp/maps"
 )
 
 // LocalState is Task state which is persisted for use when restarting Nomad

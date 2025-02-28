@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package ui
 
@@ -9,7 +9,7 @@ import (
 	"io"
 
 	"github.com/fatih/color"
-	"github.com/mitchellh/cli"
+	"github.com/hashicorp/cli"
 )
 
 // LogUI is an implementation of the cli.Ui interface which can be used for

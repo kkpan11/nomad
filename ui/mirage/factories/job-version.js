@@ -1,6 +1,6 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 import { Factory } from 'ember-cli-mirage';
@@ -30,6 +30,9 @@ export default Factory.extend({
 
   // Directive to restrict any related deployments from having a status other than 'running'
   activeDeployment: false,
+
+  // version tags
+  versionTag: null,
 
   afterCreate(version, server) {
     const args = [

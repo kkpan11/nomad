@@ -1,10 +1,10 @@
 ---
 layout: docs
-page_title: 'Drivers: Lightrun'
-description: The Lightrun driver is used to run your Java application with Lightrun.
+page_title: Lightrun task driver plugin
+description: Use the community-supported Lightrun task driver to run your Java application with Lightrun in your Nomad jobs.
 ---
 
-# Lightrun Driver
+# Lightrun task driver plugin
 
 Name: `lightrun-java`
 
@@ -56,7 +56,7 @@ task "run-with-lightrun" {
 The `lightrun-java` driver accepts all configuration options of the Nomad
 [`java`] driver.
 
-Additionaly, the `lightrun-java` driver requires the following configuration in
+Additionally, the `lightrun-java` driver requires the following configuration in
 the job spec. To find these configurations, log into the
 [Lightrun Management Portal][lightrun_portal] and refer to the **Download the
 Agent** section:

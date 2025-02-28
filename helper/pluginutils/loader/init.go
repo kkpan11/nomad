@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package loader
 
@@ -264,7 +264,16 @@ func (l *PluginLoader) fingerprintPlugins(plugins []os.FileInfo, configs map[str
 	fingerprinted := make(map[PluginID]*pluginInfo, len(plugins))
 	for _, p := range plugins {
 		name := cleanPluginExecutable(p.Name())
-		c := configs[name]
+
+		// Use the cleaned plugin name to check whether it is configured by the
+		// operator for use. If it is not, skip loading it and log a message, so
+		// operators can easily see this.
+		c, ok := configs[name]
+		if !ok {
+			l.logger.Warn("plugin not referenced in the agent configuration file, loading skipped",
+				"plugin", name)
+			continue
+		}
 		info, err := l.fingerprintPlugin(p, c)
 		if err != nil {
 			l.logger.Error("failed to fingerprint plugin", "plugin", name, "error", err)

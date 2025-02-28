@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package agent
 
@@ -19,13 +19,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/armon/go-metrics"
 	assetfs "github.com/elazarl/go-bindata-assetfs"
 	"github.com/gorilla/handlers"
 	"github.com/gorilla/websocket"
 	"github.com/hashicorp/go-connlimit"
 	log "github.com/hashicorp/go-hclog"
-	"github.com/hashicorp/go-msgpack/codec"
+	metrics "github.com/hashicorp/go-metrics/compat"
+	"github.com/hashicorp/go-msgpack/v2/codec"
 	multierror "github.com/hashicorp/go-multierror"
 	"github.com/rs/cors"
 	"golang.org/x/time/rate"
@@ -37,6 +37,7 @@ import (
 	"github.com/hashicorp/nomad/helper/tlsutil"
 	"github.com/hashicorp/nomad/nomad"
 	"github.com/hashicorp/nomad/nomad/structs"
+	"github.com/hashicorp/nomad/nomad/structs/config"
 )
 
 const (
@@ -57,6 +58,9 @@ const (
 	// MissingRequestID is a placeholder if we cannot retrieve a request
 	// UUID from context
 	MissingRequestID = "<missing request id>"
+
+	contentTypeHeader = "Content-Type"
+	plainContentType  = "text/plain; charset=utf-8"
 )
 
 var (
@@ -381,6 +385,7 @@ func (s *HTTPServer) ResolveToken(req *http.Request) (*acl.ACL, error) {
 func (s *HTTPServer) registerHandlers(enableDebug bool) {
 	s.mux.HandleFunc("/v1/jobs", s.wrap(s.JobsRequest))
 	s.mux.HandleFunc("/v1/jobs/parse", s.wrap(s.JobsParseRequest))
+	s.mux.HandleFunc("/v1/jobs/statuses", s.wrap(s.JobStatusesRequest))
 	s.mux.HandleFunc("/v1/job/", s.wrap(s.JobSpecificRequest))
 
 	s.mux.HandleFunc("/v1/nodes", s.wrap(s.NodesRequest))
@@ -399,12 +404,16 @@ func (s *HTTPServer) registerHandlers(enableDebug bool) {
 	s.mux.HandleFunc("/v1/deployments", s.wrap(s.DeploymentsRequest))
 	s.mux.HandleFunc("/v1/deployment/", s.wrap(s.DeploymentSpecificRequest))
 
+	s.mux.HandleFunc("GET /v1/volumes", s.wrap(s.ListVolumesRequest))
 	s.mux.HandleFunc("/v1/volumes", s.wrap(s.CSIVolumesRequest))
 	s.mux.HandleFunc("/v1/volumes/external", s.wrap(s.CSIExternalVolumesRequest))
 	s.mux.HandleFunc("/v1/volumes/snapshot", s.wrap(s.CSISnapshotsRequest))
 	s.mux.HandleFunc("/v1/volume/csi/", s.wrap(s.CSIVolumeSpecificRequest))
 	s.mux.HandleFunc("/v1/plugins", s.wrap(s.CSIPluginsRequest))
 	s.mux.HandleFunc("/v1/plugin/csi/", s.wrap(s.CSIPluginSpecificRequest))
+	s.mux.HandleFunc("/v1/volume/host/", s.wrap(s.HostVolumeSpecificRequest))
+	s.mux.HandleFunc("/v1/volumes/claims", s.wrap(s.TaskGroupHostVolumeClaimListRequest))
+	s.mux.HandleFunc("/v1/volumes/claim/", s.wrap(s.TaskGroupHostVolumeClaimRequest))
 
 	s.mux.HandleFunc("/v1/acl/policies", s.wrap(s.ACLPoliciesRequest))
 	s.mux.HandleFunc("/v1/acl/policy/", s.wrap(s.ACLPolicySpecificRequest))
@@ -486,6 +495,7 @@ func (s *HTTPServer) registerHandlers(enableDebug bool) {
 	s.mux.HandleFunc("/v1/operator/autopilot/configuration", s.wrap(s.OperatorAutopilotConfiguration))
 	s.mux.HandleFunc("/v1/operator/autopilot/health", s.wrap(s.OperatorServerHealth))
 	s.mux.HandleFunc("/v1/operator/snapshot", s.wrap(s.SnapshotRequest))
+	s.mux.HandleFunc("/v1/operator/upgrade-check/", s.wrap(s.UpgradeCheckRequest))
 
 	s.mux.HandleFunc("/v1/system/gc", s.wrap(s.GarbageCollectRequest))
 	s.mux.HandleFunc("/v1/system/reconcile/summaries", s.wrap(s.ReconcileJobSummaries))
@@ -501,11 +511,15 @@ func (s *HTTPServer) registerHandlers(enableDebug bool) {
 	s.mux.Handle("/v1/vars", wrapCORS(s.wrap(s.VariablesListRequest)))
 	s.mux.Handle("/v1/var/", wrapCORSWithAllowedMethods(s.wrap(s.VariableSpecificRequest), "HEAD", "GET", "PUT", "DELETE"))
 
+	// OIDC Handlers
+	s.mux.HandleFunc(structs.JWKSPath, s.wrap(s.JWKSRequest))
+	s.mux.HandleFunc("/.well-known/openid-configuration", s.wrap(s.OIDCDiscoveryRequest))
+
 	agentConfig := s.agent.GetConfig()
 	uiConfigEnabled := agentConfig.UI != nil && agentConfig.UI.Enabled
 
 	if uiEnabled && uiConfigEnabled {
-		s.mux.Handle("/ui/", http.StripPrefix("/ui/", s.handleUI(http.FileServer(&UIAssetWrapper{FileSystem: assetFS()}))))
+		s.mux.Handle("/ui/", http.StripPrefix("/ui/", s.handleUI(agentConfig.UI.ContentSecurityPolicy, http.FileServer(&UIAssetWrapper{FileSystem: assetFS()}))))
 		s.logger.Debug("UI is enabled")
 	} else {
 		// Write the stubHTML
@@ -646,10 +660,10 @@ func (e *codedError) Code() int {
 	return e.code
 }
 
-func (s *HTTPServer) handleUI(h http.Handler) http.Handler {
+func (s *HTTPServer) handleUI(policy *config.ContentSecurityPolicy, h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		header := w.Header()
-		header.Add("Content-Security-Policy", "default-src 'none'; connect-src *; img-src 'self' data:; script-src 'self'; style-src 'self' 'unsafe-inline'; form-action 'none'; frame-ancestors 'none'")
+		header.Add("Content-Security-Policy", policy.String())
 		h.ServeHTTP(w, req)
 	})
 }
@@ -661,7 +675,7 @@ func (s *HTTPServer) handleRootFallthrough() http.Handler {
 			if req.URL.RawQuery != "" {
 				url = url + "?" + req.URL.RawQuery
 			}
-			http.Redirect(w, req, url, 307)
+			http.Redirect(w, req, url, http.StatusTemporaryRedirect)
 		} else {
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -736,6 +750,7 @@ func (s *HTTPServer) wrap(handler func(resp http.ResponseWriter, req *http.Reque
 				}
 			}
 
+			resp.Header().Set(contentTypeHeader, plainContentType)
 			resp.WriteHeader(code)
 			resp.Write([]byte(errMsg))
 			if isAPIClientError(code) {
@@ -794,6 +809,7 @@ func (s *HTTPServer) wrapNonJSON(handler func(resp http.ResponseWriter, req *htt
 		// Check for an error
 		if err != nil {
 			code, errMsg := errCodeFromHandler(err)
+			resp.Header().Set(contentTypeHeader, plainContentType)
 			resp.WriteHeader(code)
 			resp.Write([]byte(errMsg))
 			if isAPIClientError(code) {
@@ -803,7 +819,6 @@ func (s *HTTPServer) wrapNonJSON(handler func(resp http.ResponseWriter, req *htt
 			}
 			return
 		}
-
 		// write response
 		if obj != nil {
 			resp.Write(obj)
@@ -877,7 +892,8 @@ func parseWait(resp http.ResponseWriter, req *http.Request, b *structs.QueryOpti
 	if wait := query.Get("wait"); wait != "" {
 		dur, err := time.ParseDuration(wait)
 		if err != nil {
-			resp.WriteHeader(400)
+			resp.Header().Set(contentTypeHeader, plainContentType)
+			resp.WriteHeader(http.StatusBadRequest)
 			resp.Write([]byte("Invalid wait time"))
 			return true
 		}
@@ -886,7 +902,8 @@ func parseWait(resp http.ResponseWriter, req *http.Request, b *structs.QueryOpti
 	if idx := query.Get("index"); idx != "" {
 		index, err := strconv.ParseUint(idx, 10, 64)
 		if err != nil {
-			resp.WriteHeader(400)
+			resp.Header().Set(contentTypeHeader, plainContentType)
+			resp.WriteHeader(http.StatusBadRequest)
 			resp.Write([]byte("Invalid index"))
 			return true
 		}
@@ -896,21 +913,24 @@ func parseWait(resp http.ResponseWriter, req *http.Request, b *structs.QueryOpti
 }
 
 // parseConsistency is used to parse the ?stale query params.
-func parseConsistency(resp http.ResponseWriter, req *http.Request, b *structs.QueryOptions) {
+func parseConsistency(resp http.ResponseWriter, req *http.Request, b *structs.QueryOptions) error {
 	query := req.URL.Query()
 	if staleVal, ok := query["stale"]; ok {
 		if len(staleVal) == 0 || staleVal[0] == "" {
 			b.AllowStale = true
-			return
+			return nil
 		}
 		staleQuery, err := strconv.ParseBool(staleVal[0])
 		if err != nil {
-			resp.WriteHeader(400)
-			_, _ = resp.Write([]byte(fmt.Sprintf("Expect `true` or `false` for `stale` query string parameter, got %s", staleVal[0])))
-			return
+			errMsg := "Expect `true` or `false` for `stale` query string parameter"
+			resp.Header().Set(contentTypeHeader, plainContentType)
+			resp.WriteHeader(http.StatusBadRequest)
+			resp.Write([]byte(errMsg))
+			return CodedError(http.StatusBadRequest, errMsg)
 		}
 		b.AllowStale = staleQuery
 	}
+	return nil
 }
 
 // parsePrefix is used to parse the ?prefix query param
@@ -1007,27 +1027,37 @@ func (s *HTTPServer) parseToken(req *http.Request, token *string) {
 func (s *HTTPServer) parse(resp http.ResponseWriter, req *http.Request, r *string, b *structs.QueryOptions) bool {
 	s.parseRegion(req, r)
 	s.parseToken(req, &b.AuthToken)
-	parseConsistency(resp, req, b)
+	if err := parseConsistency(resp, req, b); err != nil {
+		return true
+	}
 	parsePrefix(req, b)
 	parseNamespace(req, &b.Namespace)
-	parsePagination(req, b)
+	if err := parsePagination(resp, req, b); err != nil {
+		return true
+	}
 	parseFilter(req, b)
 	parseReverse(req, b)
 	return parseWait(resp, req, b)
 }
 
 // parsePagination parses the pagination fields for QueryOptions
-func parsePagination(req *http.Request, b *structs.QueryOptions) {
+func parsePagination(resp http.ResponseWriter, req *http.Request, b *structs.QueryOptions) error {
 	query := req.URL.Query()
 	rawPerPage := query.Get("per_page")
 	if rawPerPage != "" {
 		perPage, err := strconv.ParseInt(rawPerPage, 10, 32)
-		if err == nil {
-			b.PerPage = int32(perPage)
+		if err != nil {
+			errMsg := "Expect a number for `per_page` query string parameter"
+			resp.Header().Set(contentTypeHeader, plainContentType)
+			resp.WriteHeader(http.StatusBadRequest)
+			resp.Write([]byte(errMsg))
+			return CodedError(http.StatusBadRequest, errMsg)
 		}
+		b.PerPage = int32(perPage)
 	}
 
 	b.NextToken = query.Get("next_token")
+	return nil
 }
 
 // parseFilter parses the filter query parameter for QueryOptions
@@ -1049,6 +1079,32 @@ func parseNode(req *http.Request, nodeID *string) {
 	if n := req.URL.Query().Get("node_id"); n != "" {
 		*nodeID = n
 	}
+}
+
+// parseNodeListStubFields parses query parameters related to node list stubs
+// fields.
+func parseNodeListStubFields(req *http.Request) (*structs.NodeStubFields, error) {
+	fields := &structs.NodeStubFields{}
+
+	// Parse resources field selection.
+	resources, err := parseBool(req, "resources")
+	if err != nil {
+		return nil, err
+	}
+	if resources != nil {
+		fields.Resources = *resources
+	}
+
+	// Parse OS field selection.
+	os, err := parseBool(req, "os")
+	if err != nil {
+		return nil, err
+	}
+	if os != nil {
+		fields.OS = *os
+	}
+
+	return fields, nil
 }
 
 // parseWriteRequest is a convenience method for endpoints that need to parse a
@@ -1114,6 +1170,7 @@ func (a *authMiddleware) ServeHTTP(resp http.ResponseWriter, req *http.Request) 
 	reply := structs.ACLWhoAmIResponse{}
 	if a.srv.parse(resp, req, &args.Region, &args.QueryOptions) {
 		// Error parsing request, 400
+		resp.Header().Set(contentTypeHeader, plainContentType)
 		resp.WriteHeader(http.StatusBadRequest)
 		resp.Write([]byte(http.StatusText(http.StatusBadRequest)))
 		return
@@ -1121,6 +1178,7 @@ func (a *authMiddleware) ServeHTTP(resp http.ResponseWriter, req *http.Request) 
 
 	if args.AuthToken == "" {
 		// 401 instead of 403 since no token was present.
+		resp.Header().Set(contentTypeHeader, plainContentType)
 		resp.WriteHeader(http.StatusUnauthorized)
 		resp.Write([]byte(http.StatusText(http.StatusUnauthorized)))
 		return
@@ -1131,13 +1189,15 @@ func (a *authMiddleware) ServeHTTP(resp http.ResponseWriter, req *http.Request) 
 		// credentials, so convert it to a Forbidden response code.
 		if strings.HasSuffix(err.Error(), structs.ErrPermissionDenied.Error()) {
 			a.srv.logger.Debug("Failed to authenticated Task API request", "method", req.Method, "url", req.URL)
+			resp.Header().Set(contentTypeHeader, plainContentType)
 			resp.WriteHeader(http.StatusForbidden)
 			resp.Write([]byte(http.StatusText(http.StatusForbidden)))
 			return
 		}
 
 		a.srv.logger.Error("error authenticating built API request", "error", err, "url", req.URL, "method", req.Method)
-		resp.WriteHeader(500)
+		resp.Header().Set(contentTypeHeader, plainContentType)
+		resp.WriteHeader(http.StatusInternalServerError)
 		resp.Write([]byte("Server error authenticating request\n"))
 		return
 	}
@@ -1145,6 +1205,7 @@ func (a *authMiddleware) ServeHTTP(resp http.ResponseWriter, req *http.Request) 
 	// Require an acl token or workload identity
 	if reply.Identity == nil || (reply.Identity.ACLToken == nil && reply.Identity.Claims == nil) {
 		a.srv.logger.Debug("Failed to authenticated Task API request", "method", req.Method, "url", req.URL)
+		resp.Header().Set(contentTypeHeader, plainContentType)
 		resp.WriteHeader(http.StatusForbidden)
 		resp.Write([]byte(http.StatusText(http.StatusForbidden)))
 		return

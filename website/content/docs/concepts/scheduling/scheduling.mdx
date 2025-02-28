@@ -1,14 +1,16 @@
 ---
 layout: docs
-page_title: Scheduling
-description: Learn about how scheduling works in Nomad.
+page_title: Scheduling in Nomad
+description: Nomad implements job scheduling using jobs, nodes, allocations, and evaluations. Learn about job lifecycle and how the job schedular generates the allocation plan that the server implements using a service, batch, system, sysbatch, or core scheduler.
 ---
 
 # Scheduling in Nomad
 
+This page provides conceptual information on how Nomad implements job scheduling using jobs, nodes, allocations, and evaluations. Learn about job lifecycle and how the job schedular generates the allocation plan that the server implements using a service, batch, system, sysbatch, or core scheduler.
+
 [![Nomad Data Model][img-data-model]][img-data-model]
 
-There are four primary "nouns" in Nomad; jobs, nodes, allocations, and
+There are four primary components in Nomad: jobs, nodes, allocations, and
 evaluations. Jobs are submitted by users and represent a _desired state_. A job
 is a declarative description of tasks to run which are bounded by constraints
 and require resources. Tasks can be scheduled on nodes in the cluster running
@@ -52,8 +54,9 @@ and existing allocations may need to be updated, migrated, or stopped.
 
 Placing allocations is split into two distinct phases, feasibility checking and
 ranking. In the first phase the scheduler finds nodes that are feasible by
-filtering unhealthy nodes, those missing necessary drivers, and those failing
-the specified constraints.
+filtering nodes in datacenters and node pools not used by the job, unhealthy
+nodes, those missing necessary drivers, and those failing the specified
+constraints.
 
 The second phase is ranking, where the scheduler scores feasible nodes to find
 the best fit. Scoring is primarily based on bin packing, which is used to

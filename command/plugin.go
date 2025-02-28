@@ -1,9 +1,9 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package command
 
-import "github.com/mitchellh/cli"
+import "github.com/hashicorp/cli"
 
 type PluginCommand struct {
 	Meta

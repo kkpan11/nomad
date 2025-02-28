@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package nomad
 
@@ -59,13 +59,14 @@ func testFSM(t *testing.T) *nomadFSM {
 	dispatcher, _ := testPeriodicDispatcher(t)
 	logger := testlog.HCLogger(t)
 	fsmConfig := &FSMConfig{
-		EvalBroker:        broker,
-		Periodic:          dispatcher,
-		Blocked:           NewBlockedEvals(broker, logger),
-		Logger:            logger,
-		Region:            "global",
-		EnableEventBroker: true,
-		EventBufferSize:   100,
+		EvalBroker:         broker,
+		Periodic:           dispatcher,
+		Blocked:            NewBlockedEvals(broker, logger),
+		Logger:             logger,
+		Region:             "global",
+		EnableEventBroker:  true,
+		EventBufferSize:    100,
+		JobTrackedVersions: structs.JobDefaultTrackedVersions,
 	}
 	fsm, err := NewFSM(fsmConfig)
 	if err != nil {
@@ -168,12 +169,6 @@ func TestFSM_UpsertNode(t *testing.T) {
 		t.Fatalf("bad index: %d", node.CreateIndex)
 	}
 
-	tt := fsm.TimeTable()
-	index := tt.NearestIndex(time.Now().UTC())
-	if index != 1 {
-		t.Fatalf("bad: %d", index)
-	}
-
 	// Verify the eval was unblocked.
 	testutil.WaitForResult(func() (bool, error) {
 		bStats := fsm.blockedEvals.Stats()
@@ -244,66 +239,58 @@ func TestFSM_UpsertNode_Canonicalize_Ineligible(t *testing.T) {
 func TestFSM_UpsertNode_NodePool(t *testing.T) {
 	ci.Parallel(t)
 
-	fsm := testFSM(t)
-
-	// Populate state with a test node pool.
-	existingPool := mock.NodePool()
-	err := fsm.State().UpsertNodePools(structs.MsgTypeTestSetup, 1000, []*structs.NodePool{existingPool})
-	must.NoError(t, err)
-
 	testCases := []struct {
-		name         string
-		previousPool string
-		pool         string
-		validateFn   func(*testing.T, *structs.Node, *structs.NodePool)
+		name       string
+		setupReqFn func(*structs.NodeRegisterRequest)
+		validateFn func(*testing.T, *structs.Node, *structs.NodePool)
 	}{
 		{
-			name: "new node pool",
-			pool: "new",
-			validateFn: func(t *testing.T, node *structs.Node, pool *structs.NodePool) {
-				// Verify node pool was created in the same transaction as the
-				// node registration.
-				must.Eq(t, pool.CreateIndex, node.ModifyIndex)
+			name: "node with empty node pool is placed in defualt",
+			setupReqFn: func(req *structs.NodeRegisterRequest) {
+				req.Node.NodePool = ""
 			},
-		},
-		{
-			name: "existing node pool",
-			pool: existingPool.Name,
 			validateFn: func(t *testing.T, node *structs.Node, pool *structs.NodePool) {
-				// Verify node pool was not modified.
-				must.NotEq(t, pool.CreateIndex, node.ModifyIndex)
-			},
-		},
-		{
-			name: "built-in node pool",
-			pool: structs.NodePoolDefault,
-			validateFn: func(t *testing.T, node *structs.Node, pool *structs.NodePool) {
-				// Verify node pool was not modified.
+				must.Eq(t, structs.NodePoolDefault, node.NodePool)
 				must.Eq(t, 1, pool.ModifyIndex)
 			},
 		},
 		{
-			name:         "move node to another node pool",
-			previousPool: structs.NodePoolDefault,
-			pool:         "new",
+			name: "create new node pool with node",
+			setupReqFn: func(req *structs.NodeRegisterRequest) {
+				req.Node.NodePool = "new"
+				req.CreateNodePool = true
+			},
+			validateFn: func(t *testing.T, node *structs.Node, pool *structs.NodePool) {
+				must.NotNil(t, pool)
+				must.Eq(t, "new", pool.Name)
+				must.Eq(t, pool.Name, node.NodePool)
+				must.Eq(t, node.ModifyIndex, pool.CreateIndex)
+			},
+		},
+		{
+			name: "don't create new node pool with node",
+			setupReqFn: func(req *structs.NodeRegisterRequest) {
+				req.Node.NodePool = "new"
+				req.CreateNodePool = false
+			},
+			validateFn: func(t *testing.T, node *structs.Node, pool *structs.NodePool) {
+				must.Nil(t, pool)
+				must.Eq(t, "new", node.NodePool)
+			},
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
+			fsm := testFSM(t)
+
 			node := mock.Node()
-
-			// Pre-create node if test cases specifies if belonged to a
-			// previous node pool.
-			if tc.previousPool != "" {
-				node.NodePool = tc.previousPool
-				err := fsm.State().UpsertNode(structs.MsgTypeTestSetup, 1001, node)
-				must.NoError(t, err)
+			req := structs.NodeRegisterRequest{
+				Node: node,
 			}
-
-			// Set the node pool and apply node register log.
-			node.NodePool = tc.pool
-			req := structs.NodeRegisterRequest{Node: node}
+			if tc.setupReqFn != nil {
+				tc.setupReqFn(&req)
+			}
 			buf, err := structs.Encode(structs.NodeRegisterRequestType, req)
 			must.NoError(t, err)
 
@@ -313,21 +300,14 @@ func TestFSM_UpsertNode_NodePool(t *testing.T) {
 			// Snapshot the state.
 			s := fsm.State()
 
-			// Verify node exists.
-			got, err := s.NodeByID(nil, node.ID)
+			gotNode, err := s.NodeByID(nil, node.ID)
 			must.NoError(t, err)
-			must.NotNil(t, got)
 
-			// Verify node pool exists.
-			pool, err := s.NodePoolByName(nil, tc.pool)
+			gotPool, err := s.NodePoolByName(nil, gotNode.NodePool)
 			must.NoError(t, err)
-			must.NotNil(t, pool)
-
-			// Verify node was assigned to node pool.
-			must.Eq(t, pool.Name, got.NodePool)
 
 			if tc.validateFn != nil {
-				tc.validateFn(t, got, pool)
+				tc.validateFn(t, gotNode, gotPool)
 			}
 		})
 	}
@@ -1572,99 +1552,6 @@ func TestFSM_UpdateAllocDesiredTransition(t *testing.T) {
 	require.True(*out2.DesiredTransition.Migrate)
 }
 
-func TestFSM_UpsertVaultAccessor(t *testing.T) {
-	ci.Parallel(t)
-	fsm := testFSM(t)
-	fsm.blockedEvals.SetEnabled(true)
-
-	va := mock.VaultAccessor()
-	va2 := mock.VaultAccessor()
-	req := structs.VaultAccessorsRequest{
-		Accessors: []*structs.VaultAccessor{va, va2},
-	}
-	buf, err := structs.Encode(structs.VaultAccessorRegisterRequestType, req)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-
-	resp := fsm.Apply(makeLog(buf))
-	if resp != nil {
-		t.Fatalf("resp: %v", resp)
-	}
-
-	// Verify we are registered
-	ws := memdb.NewWatchSet()
-	out1, err := fsm.State().VaultAccessor(ws, va.Accessor)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	if out1 == nil {
-		t.Fatalf("not found!")
-	}
-	if out1.CreateIndex != 1 {
-		t.Fatalf("bad index: %d", out1.CreateIndex)
-	}
-	out2, err := fsm.State().VaultAccessor(ws, va2.Accessor)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	if out2 == nil {
-		t.Fatalf("not found!")
-	}
-	if out1.CreateIndex != 1 {
-		t.Fatalf("bad index: %d", out2.CreateIndex)
-	}
-
-	tt := fsm.TimeTable()
-	index := tt.NearestIndex(time.Now().UTC())
-	if index != 1 {
-		t.Fatalf("bad: %d", index)
-	}
-}
-
-func TestFSM_DeregisterVaultAccessor(t *testing.T) {
-	ci.Parallel(t)
-	fsm := testFSM(t)
-	fsm.blockedEvals.SetEnabled(true)
-
-	va := mock.VaultAccessor()
-	va2 := mock.VaultAccessor()
-	accessors := []*structs.VaultAccessor{va, va2}
-
-	// Insert the accessors
-	if err := fsm.State().UpsertVaultAccessor(1000, accessors); err != nil {
-		t.Fatalf("bad: %v", err)
-	}
-
-	req := structs.VaultAccessorsRequest{
-		Accessors: accessors,
-	}
-	buf, err := structs.Encode(structs.VaultAccessorDeregisterRequestType, req)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-
-	resp := fsm.Apply(makeLog(buf))
-	if resp != nil {
-		t.Fatalf("resp: %v", resp)
-	}
-
-	ws := memdb.NewWatchSet()
-	out1, err := fsm.State().VaultAccessor(ws, va.Accessor)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	if out1 != nil {
-		t.Fatalf("not deleted!")
-	}
-
-	tt := fsm.TimeTable()
-	index := tt.NearestIndex(time.Now().UTC())
-	if index != 1 {
-		t.Fatalf("bad: %d", index)
-	}
-}
-
 func TestFSM_UpsertSITokenAccessor(t *testing.T) {
 	ci.Parallel(t)
 	r := require.New(t)
@@ -1694,10 +1581,6 @@ func TestFSM_UpsertSITokenAccessor(t *testing.T) {
 	r.NoError(err)
 	r.NotNil(result2)
 	r.Equal(uint64(1), result2.CreateIndex)
-
-	tt := fsm.TimeTable()
-	latestIndex := tt.NearestIndex(time.Now())
-	r.Equal(uint64(1), latestIndex)
 }
 
 func TestFSM_DeregisterSITokenAccessor(t *testing.T) {
@@ -1732,10 +1615,6 @@ func TestFSM_DeregisterSITokenAccessor(t *testing.T) {
 	result2, err := fsm.State().SITokenAccessor(ws, a2.AccessorID)
 	r.NoError(err)
 	r.Nil(result2) // should have been deleted
-
-	tt := fsm.TimeTable()
-	latestIndex := tt.NearestIndex(time.Now())
-	r.Equal(uint64(1), latestIndex)
 }
 
 func TestFSM_ApplyPlanResults(t *testing.T) {
@@ -2440,9 +2319,7 @@ func TestFSM_SnapshotRestore_Nodes(t *testing.T) {
 	fsm2 := testSnapshotRestore(t, fsm)
 	state2 := fsm2.State()
 	out, _ := state2.NodeByID(nil, node.ID)
-	if !reflect.DeepEqual(node, out) {
-		t.Fatalf("bad: \n%#v\n%#v", out, node)
-	}
+	must.Eq(t, node, out)
 }
 
 func TestFSM_SnapshotRestore_NodePools(t *testing.T) {
@@ -2583,28 +2460,6 @@ func TestFSM_SnapshotRestore_Indexes(t *testing.T) {
 	}
 }
 
-func TestFSM_SnapshotRestore_TimeTable(t *testing.T) {
-	ci.Parallel(t)
-	// Add some state
-	fsm := testFSM(t)
-
-	tt := fsm.TimeTable()
-	start := time.Now().UTC()
-	tt.Witness(1000, start)
-	tt.Witness(2000, start.Add(10*time.Minute))
-
-	// Verify the contents
-	fsm2 := testSnapshotRestore(t, fsm)
-
-	tt2 := fsm2.TimeTable()
-	if tt2.NearestTime(1500) != start {
-		t.Fatalf("bad")
-	}
-	if tt2.NearestIndex(start.Add(15*time.Minute)) != 2000 {
-		t.Fatalf("bad")
-	}
-}
-
 func TestFSM_SnapshotRestore_PeriodicLaunches(t *testing.T) {
 	ci.Parallel(t)
 	// Add some state
@@ -2665,29 +2520,6 @@ func TestFSM_SnapshotRestore_JobSummary(t *testing.T) {
 	}
 	if !reflect.DeepEqual(js2, out2) {
 		t.Fatalf("bad: \n%#v\n%#v", js2, out2)
-	}
-}
-
-func TestFSM_SnapshotRestore_VaultAccessors(t *testing.T) {
-	ci.Parallel(t)
-	// Add some state
-	fsm := testFSM(t)
-	state := fsm.State()
-	a1 := mock.VaultAccessor()
-	a2 := mock.VaultAccessor()
-	state.UpsertVaultAccessor(1000, []*structs.VaultAccessor{a1, a2})
-
-	// Verify the contents
-	fsm2 := testSnapshotRestore(t, fsm)
-	state2 := fsm2.State()
-	ws := memdb.NewWatchSet()
-	out1, _ := state2.VaultAccessor(ws, a1.Accessor)
-	out2, _ := state2.VaultAccessor(ws, a2.Accessor)
-	if !reflect.DeepEqual(a1, out1) {
-		t.Fatalf("bad: \n%#v\n%#v", out1, a1)
-	}
-	if !reflect.DeepEqual(a2, out2) {
-		t.Fatalf("bad: \n%#v\n%#v", out2, a2)
 	}
 }
 
@@ -2948,6 +2780,60 @@ func TestFSM_SnapshotRestore_ACLBindingRules(t *testing.T) {
 		restoredACLBindingRules = append(restoredACLBindingRules, raw.(*structs.ACLBindingRule))
 	}
 	must.SliceContainsAll(t, restoredACLBindingRules, mockedACLBindingRoles)
+}
+
+func TestFSM_SnapshotRestore_JobSubmissions(t *testing.T) {
+	ci.Parallel(t)
+
+	// Create our initial FSM which will be snapshotted.
+	fsm := testFSM(t)
+	testState := fsm.State()
+
+	// Create a non-default namespace, so we can later create jobs and
+	// submissions within it.
+	mockNamespace := mock.Namespace()
+	mockNamespace.Name = "platform"
+
+	must.NoError(t, testState.UpsertNamespaces(10, []*structs.Namespace{mockNamespace}))
+
+	// Generate a some mocked jobs and submissions to insert directly into
+	// state.
+	mockJob1 := mock.Job()
+	mockJobSubmission1 := &structs.JobSubmission{
+		Source:         "job{}",
+		Namespace:      mockJob1.Namespace,
+		JobID:          mockJob1.ID,
+		Version:        mockJob1.Version,
+		JobModifyIndex: mockJob1.JobModifyIndex,
+	}
+
+	must.NoError(t, testState.UpsertJob(structs.MsgTypeTestSetup, mockJob1.ModifyIndex, mockJobSubmission1, mockJob1))
+
+	mockJob2 := mock.Job()
+	mockJob2.Namespace = mockNamespace.Name
+	mockJobSubmission2 := &structs.JobSubmission{
+		Source:         "job{}",
+		Namespace:      mockJob2.Namespace,
+		JobID:          mockJob2.ID,
+		Version:        mockJob2.Version,
+		JobModifyIndex: mockJob2.JobModifyIndex,
+	}
+
+	must.NoError(t, testState.UpsertJob(structs.MsgTypeTestSetup, mockJob2.ModifyIndex, mockJobSubmission2, mockJob2))
+
+	// Perform a snapshot restore.
+	restoredFSM := testSnapshotRestore(t, fsm)
+	restoredState := restoredFSM.State()
+
+	jobSubmission1Resp, err := restoredState.JobSubmission(
+		nil, mockJobSubmission1.Namespace, mockJobSubmission1.JobID, mockJobSubmission1.Version)
+	must.NoError(t, err)
+	must.Eq(t, mockJobSubmission1, jobSubmission1Resp)
+
+	jobSubmission2Resp, err := restoredState.JobSubmission(
+		nil, mockJobSubmission2.Namespace, mockJobSubmission2.JobID, mockJobSubmission2.Version)
+	must.NoError(t, err)
+	must.Eq(t, mockJobSubmission2, jobSubmission2Resp)
 }
 
 func TestFSM_ReconcileSummaries(t *testing.T) {
@@ -3321,6 +3207,29 @@ func TestFSM_DeleteNamespaces(t *testing.T) {
 	assert.Nil(out)
 }
 
+func TestFSM_DeleteNamespaces_ErrorSurfacing(t *testing.T) {
+	ci.Parallel(t)
+	fsm := testFSM(t)
+
+	ns1 := mock.Namespace()
+	// force a failure by making this the default
+	ns1.Name = "default"
+	must.NoError(t, fsm.State().UpsertNamespaces(1000, []*structs.Namespace{ns1}))
+
+	req := structs.NamespaceDeleteRequest{
+		Namespaces: []string{ns1.Name},
+	}
+
+	buf, err := structs.Encode(structs.NamespaceDeleteRequestType, req)
+	must.NoError(t, err)
+	resp := fsm.Apply(makeLog(buf))
+	must.NotNil(t, resp)
+
+	err, ok := resp.(error)
+	must.True(t, ok, must.Sprintf("resp not of error type: %T %v", resp, resp))
+	must.ErrorContains(t, err, "default namespace can not be deleted")
+}
+
 func TestFSM_SnapshotRestore_Namespaces(t *testing.T) {
 	ci.Parallel(t)
 	// Add some state
@@ -3663,7 +3572,7 @@ func TestFSM_ACLEvents(t *testing.T) {
 				Topics: map[structs.Topic][]string{
 					tc.reqTopic: {"*"},
 				},
-				Namespace: "default",
+				Namespaces: []string{"default"},
 			}
 
 			sub, err := broker.Subscribe(subReq)
@@ -3717,7 +3626,7 @@ func TestFSM_EventBroker_JobRegisterFSMEvents(t *testing.T) {
 		Topics: map[structs.Topic][]string{
 			structs.TopicJob: {"*"},
 		},
-		Namespace: "default",
+		Namespaces: []string{"default"},
 	}
 
 	sub, err := broker.Subscribe(subReq)

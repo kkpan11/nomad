@@ -1,6 +1,6 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 import { assign } from '@ember/polyfills';
@@ -31,6 +31,8 @@ module('Integration | Component | job-page/service', function (hooks) {
     this.store = this.owner.lookup('service:store');
     this.server = startMirage();
     this.server.create('namespace');
+    this.server.create('node-pool');
+    this.server.create('node');
   });
 
   hooks.afterEach(function () {
@@ -108,9 +110,13 @@ module('Integration | Component | job-page/service', function (hooks) {
   });
 
   test('Starting a job sends a post request for the job using the current definition', async function (assert) {
-    assert.expect(2);
+    assert.expect(1);
 
-    const mirageJob = makeMirageJob(this.server, { status: 'dead' });
+    const mirageJob = makeMirageJob(this.server, {
+      status: 'dead',
+      withPreviousStableVersion: true,
+      stopped: true,
+    });
     await this.store.findAll('job');
 
     const job = this.store.peekAll('job').findBy('plainId', mirageJob.id);
@@ -127,7 +133,11 @@ module('Integration | Component | job-page/service', function (hooks) {
 
     this.server.pretender.post('/v1/job/:id', () => [403, {}, '']);
 
-    const mirageJob = makeMirageJob(this.server, { status: 'dead' });
+    const mirageJob = makeMirageJob(this.server, {
+      status: 'dead',
+      withPreviousStableVersion: true,
+      stopped: true,
+    });
     await this.store.findAll('job');
 
     const job = this.store.peekAll('job').findBy('plainId', mirageJob.id);
@@ -136,14 +146,16 @@ module('Integration | Component | job-page/service', function (hooks) {
     await render(commonTemplate);
 
     await startJob();
-
     await expectError(assert, 'Could Not Start Job');
   });
 
   test('Purging a job sends a purge request for the job', async function (assert) {
     assert.expect(1);
 
-    const mirageJob = makeMirageJob(this.server, { status: 'dead' });
+    const mirageJob = makeMirageJob(this.server, {
+      status: 'dead',
+      withPreviousStableVersion: true,
+    });
     await this.store.findAll('job');
 
     const job = this.store.peekAll('job').findBy('plainId', mirageJob.id);
@@ -226,11 +238,25 @@ module('Integration | Component | job-page/service', function (hooks) {
     this.server.create('node');
     const mirageJob = makeMirageJob(this.server, { activeDeployment: true });
 
-    await this.store.findAll('job');
+    const fullId = JSON.stringify([mirageJob.name, 'default']);
+    await this.store.findRecord('job', fullId);
 
     const job = this.store.peekAll('job').findBy('plainId', mirageJob.id);
+    this.server.db.jobs.update(mirageJob.id, {
+      activeDeployment: true,
+      noDeployments: true,
+    });
     const deployment = await job.get('latestDeployment');
 
+    server.create('allocation', {
+      jobId: mirageJob.id,
+      deploymentId: deployment.id,
+      clientStatus: 'running',
+      deploymentStatus: {
+        Healthy: true,
+        Canary: true,
+      },
+    });
     this.setProperties(commonProperties(job));
     await render(commonTemplate);
 
@@ -258,9 +284,25 @@ module('Integration | Component | job-page/service', function (hooks) {
     this.server.create('node');
     const mirageJob = makeMirageJob(this.server, { activeDeployment: true });
 
-    await this.store.findAll('job');
+    const fullId = JSON.stringify([mirageJob.name, 'default']);
+    await this.store.findRecord('job', fullId);
 
     const job = this.store.peekAll('job').findBy('plainId', mirageJob.id);
+    this.server.db.jobs.update(mirageJob.id, {
+      activeDeployment: true,
+      noDeployments: true,
+    });
+    const deployment = await job.get('latestDeployment');
+
+    server.create('allocation', {
+      jobId: mirageJob.id,
+      deploymentId: deployment.id,
+      clientStatus: 'running',
+      deploymentStatus: {
+        Healthy: true,
+        Canary: true,
+      },
+    });
 
     this.setProperties(commonProperties(job));
     await render(commonTemplate);
@@ -303,8 +345,7 @@ module('Integration | Component | job-page/service', function (hooks) {
     this.setProperties(commonProperties(job));
     await render(commonTemplate);
 
-    await click('.active-deployment [data-test-idle-button]');
-    await click('.active-deployment [data-test-confirm-button]');
+    await click('.active-deployment [data-test-fail]');
 
     const requests = this.server.pretender.handledRequests;
 
@@ -331,8 +372,7 @@ module('Integration | Component | job-page/service', function (hooks) {
     this.setProperties(commonProperties(job));
     await render(commonTemplate);
 
-    await click('.active-deployment [data-test-idle-button]');
-    await click('.active-deployment [data-test-confirm-button]');
+    await click('.active-deployment [data-test-fail]');
 
     assert.equal(
       find('[data-test-job-error-title]').textContent,

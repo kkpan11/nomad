@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package fingerprint
 
@@ -9,10 +9,13 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/aws/smithy-go"
+	smithyHttp "github.com/aws/smithy-go/transport/http"
 	"github.com/hashicorp/nomad/ci"
 	"github.com/hashicorp/nomad/client/config"
 	"github.com/hashicorp/nomad/helper/testlog"
 	"github.com/hashicorp/nomad/nomad/structs"
+	"github.com/shoenig/test/must"
 	"github.com/stretchr/testify/require"
 )
 
@@ -74,6 +77,45 @@ func TestEnvAWSFingerprint_aws(t *testing.T) {
 	// confirm we have at least instance-id and ami-id
 	for _, k := range []string{"aws.ec2"} {
 		assertNodeLinksContains(t, response.Links, k)
+	}
+}
+
+func TestEnvAWSFingerprint_handleImdsError(t *testing.T) {
+	ci.Parallel(t)
+
+	f := NewEnvAWSFingerprint(testlog.HCLogger(t))
+
+	cases := []struct {
+		name string
+		err  error
+		exp  error
+	}{
+		{
+			name: "random errors return error",
+			err:  fmt.Errorf("not http error"),
+			exp:  fmt.Errorf("not http error"),
+		},
+		{
+			name: "other smithy errors return error",
+			err:  &smithy.OperationError{},
+			exp:  &smithy.OperationError{},
+		},
+		{
+			name: "http response errors correctly handled",
+			err: &smithyHttp.ResponseError{
+				Response: &smithyHttp.Response{
+					Response: &http.Response{
+						StatusCode: 404,
+					},
+				},
+			},
+			exp: nil,
+		},
+	}
+
+	for _, c := range cases {
+		err := f.(*EnvAWSFingerprint).handleImdsError(c.err, "some attribute")
+		must.Eq(t, c.exp, err)
 	}
 }
 
@@ -192,6 +234,9 @@ func TestNetworkFingerprint_AWS_NoNetwork(t *testing.T) {
 
 	require.Equal(t, "ami-1234", response.Attributes["platform.aws.ami-id"])
 
+	// assert the key is not present in the Attributes map if the return value was empty
+	require.NotContains(t, response.Attributes, "unique.platform.aws.local-ipv4")
+
 	require.Nil(t, response.NodeResources.Networks)
 }
 
@@ -235,36 +280,6 @@ func TestCPUFingerprint_AWS_InstanceFound(t *testing.T) {
 	err := f.Fingerprint(request, &response)
 	require.NoError(t, err)
 	require.True(t, response.Detected)
-	require.Equal(t, "2200", response.Attributes["cpu.frequency"])
-	require.Equal(t, "8", response.Attributes["cpu.numcores"])
-	require.Equal(t, "17600", response.Attributes["cpu.totalcompute"])
-	require.Equal(t, 17600, response.Resources.CPU)
-	require.Equal(t, int64(17600), response.NodeResources.Cpu.CpuShares)
-}
-
-func TestCPUFingerprint_AWS_OverrideCompute(t *testing.T) {
-	ci.Parallel(t)
-
-	endpoint, cleanup := startFakeEC2Metadata(t, awsStubs)
-	defer cleanup()
-
-	f := NewEnvAWSFingerprint(testlog.HCLogger(t))
-	f.(*EnvAWSFingerprint).endpoint = endpoint
-
-	node := &structs.Node{Attributes: make(map[string]string)}
-
-	request := &FingerprintRequest{Config: &config.Config{
-		CpuCompute: 99999,
-	}, Node: node}
-	var response FingerprintResponse
-	err := f.Fingerprint(request, &response)
-	require.NoError(t, err)
-	require.True(t, response.Detected)
-	require.Equal(t, "2200", response.Attributes["cpu.frequency"])
-	require.Equal(t, "8", response.Attributes["cpu.numcores"])
-	require.Equal(t, "99999", response.Attributes["cpu.totalcompute"])
-	require.Nil(t, response.Resources)          // defaults in cpu fingerprinter
-	require.Zero(t, response.NodeResources.Cpu) // defaults in cpu fingerprinter
 }
 
 func TestCPUFingerprint_AWS_InstanceNotFound(t *testing.T) {
@@ -283,12 +298,6 @@ func TestCPUFingerprint_AWS_InstanceNotFound(t *testing.T) {
 	err := f.Fingerprint(request, &response)
 	require.NoError(t, err)
 	require.True(t, response.Detected)
-	require.NotContains(t, response.Attributes, "cpu.modelname")
-	require.NotContains(t, response.Attributes, "cpu.frequency")
-	require.NotContains(t, response.Attributes, "cpu.numcores")
-	require.NotContains(t, response.Attributes, "cpu.totalcompute")
-	require.Nil(t, response.Resources)
-	require.Nil(t, response.NodeResources)
 }
 
 /// Utility functions for tests

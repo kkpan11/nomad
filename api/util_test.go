@@ -48,6 +48,14 @@ func testJob() *Job {
 	return job
 }
 
+func testServiceJob() *Job {
+	// Create a job of type service
+	task := NewTask("dummy-task", "exec").SetConfig("command", "/bin/sleep")
+	group1 := NewTaskGroup("dummy-group", 1).AddTask(task)
+	job := NewServiceJob("dummy-service", "dummy-service", "global", 5).AddTaskGroup(group1)
+	return job
+}
+
 func testJobWithScalingPolicy() *Job {
 	job := testJob()
 	job.TaskGroups[0].Scaling = &ScalingPolicy{
@@ -108,9 +116,13 @@ func testQuotaSpec() *QuotaSpec {
 		Limits: []*QuotaLimit{
 			{
 				Region: "global",
-				RegionLimit: &Resources{
+				RegionLimit: &QuotaResources{
 					CPU:      pointerOf(2000),
 					MemoryMB: pointerOf(2000),
+					Devices: []*RequestedDevice{{
+						Name:  "nvidia/gpu/1080ti",
+						Count: pointerOf(uint64(2)),
+					}},
 				},
 			},
 		},

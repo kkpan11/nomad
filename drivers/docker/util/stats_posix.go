@@ -1,16 +1,14 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 //go:build !windows
 
 package util
 
 import (
-	"runtime"
-
-	docker "github.com/fsouza/go-dockerclient"
+	containerapi "github.com/docker/docker/api/types/container"
+	"github.com/hashicorp/nomad/client/lib/cpustats"
 	cstructs "github.com/hashicorp/nomad/client/structs"
-	"github.com/hashicorp/nomad/helper/stats"
 )
 
 var (
@@ -21,20 +19,22 @@ var (
 	DockerCgroupV2MeasuredMemStats = []string{"Cache", "Swap", "Usage"}
 )
 
-func DockerStatsToTaskResourceUsage(s *docker.Stats) *cstructs.TaskResourceUsage {
+func DockerStatsToTaskResourceUsage(s *containerapi.Stats, compute cpustats.Compute) *cstructs.TaskResourceUsage {
+	var (
+		totalCompute = compute.TotalCompute
+		totalCores   = compute.NumCores
+	)
+
 	measuredMems := DockerCgroupV1MeasuredMemStats
 
 	// use a simple heuristic to check if cgroup-v2 is used.
 	// go-dockerclient doesn't distinguish between 0 and not-present value
-	if s.MemoryStats.Stats.Rss == 0 && s.MemoryStats.MaxUsage == 0 && s.MemoryStats.Usage != 0 {
+	if s.MemoryStats.MaxUsage == 0 && s.MemoryStats.Usage != 0 {
 		measuredMems = DockerCgroupV2MeasuredMemStats
 	}
 
 	ms := &cstructs.MemoryStats{
-		RSS:        s.MemoryStats.Stats.Rss,
-		Cache:      s.MemoryStats.Stats.Cache,
-		Swap:       s.MemoryStats.Stats.Swap,
-		MappedFile: s.MemoryStats.Stats.MappedFile,
+		MappedFile: s.MemoryStats.Stats["file_mapped"],
 		Usage:      s.MemoryStats.Usage,
 		MaxUsage:   s.MemoryStats.MaxUsage,
 		Measured:   measuredMems,
@@ -49,14 +49,15 @@ func DockerStatsToTaskResourceUsage(s *docker.Stats) *cstructs.TaskResourceUsage
 	// Calculate percentage
 	cs.Percent = CalculateCPUPercent(
 		s.CPUStats.CPUUsage.TotalUsage, s.PreCPUStats.CPUUsage.TotalUsage,
-		s.CPUStats.SystemCPUUsage, s.PreCPUStats.SystemCPUUsage, runtime.NumCPU())
+		s.CPUStats.SystemUsage, s.PreCPUStats.SystemUsage, totalCores)
 	cs.SystemMode = CalculateCPUPercent(
 		s.CPUStats.CPUUsage.UsageInKernelmode, s.PreCPUStats.CPUUsage.UsageInKernelmode,
-		s.CPUStats.CPUUsage.TotalUsage, s.PreCPUStats.CPUUsage.TotalUsage, runtime.NumCPU())
+		s.CPUStats.CPUUsage.TotalUsage, s.PreCPUStats.CPUUsage.TotalUsage, totalCores)
 	cs.UserMode = CalculateCPUPercent(
 		s.CPUStats.CPUUsage.UsageInUsermode, s.PreCPUStats.CPUUsage.UsageInUsermode,
-		s.CPUStats.CPUUsage.TotalUsage, s.PreCPUStats.CPUUsage.TotalUsage, runtime.NumCPU())
-	cs.TotalTicks = (cs.Percent / 100) * float64(stats.TotalTicksAvailable()) / float64(runtime.NumCPU())
+		s.CPUStats.CPUUsage.TotalUsage, s.PreCPUStats.CPUUsage.TotalUsage, totalCores)
+
+	cs.TotalTicks = (cs.Percent / 100) * float64(totalCompute) / float64(totalCores)
 
 	return &cstructs.TaskResourceUsage{
 		ResourceUsage: &cstructs.ResourceUsage{

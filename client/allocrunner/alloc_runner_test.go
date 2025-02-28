@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package allocrunner
 
@@ -13,18 +13,18 @@ import (
 	"time"
 
 	"github.com/hashicorp/consul/api"
+	metrics "github.com/hashicorp/go-metrics/compat"
 	multierror "github.com/hashicorp/go-multierror"
-	"github.com/shoenig/test/must"
-	"github.com/shoenig/test/wait"
-	"github.com/stretchr/testify/require"
-
 	"github.com/hashicorp/nomad/ci"
 	"github.com/hashicorp/nomad/client/allochealth"
+	"github.com/hashicorp/nomad/client/allocrunner/hookstats"
 	"github.com/hashicorp/nomad/client/allocrunner/interfaces"
 	arstate "github.com/hashicorp/nomad/client/allocrunner/state"
 	"github.com/hashicorp/nomad/client/allocrunner/tasklifecycle"
 	"github.com/hashicorp/nomad/client/allocrunner/taskrunner"
 	"github.com/hashicorp/nomad/client/allocwatcher"
+	client "github.com/hashicorp/nomad/client/config"
+	"github.com/hashicorp/nomad/client/lib/proclib"
 	"github.com/hashicorp/nomad/client/serviceregistration"
 	regMock "github.com/hashicorp/nomad/client/serviceregistration/mock"
 	"github.com/hashicorp/nomad/client/state"
@@ -33,6 +33,9 @@ import (
 	"github.com/hashicorp/nomad/nomad/mock"
 	"github.com/hashicorp/nomad/nomad/structs"
 	"github.com/hashicorp/nomad/testutil"
+	"github.com/shoenig/test/must"
+	"github.com/shoenig/test/wait"
+	"github.com/stretchr/testify/require"
 )
 
 // destroy does a blocking destroy on an alloc runner
@@ -1051,9 +1054,9 @@ func TestAllocRunner_TaskGroup_ShutdownDelay(t *testing.T) {
 		t.Fatalf("err: %v", err)
 	})
 
-	// Get consul client operations
-	consulClient := conf.Consul.(*regMock.ServiceRegistrationHandler)
-	consulOpts := consulClient.GetOps()
+	// Get consul operations
+	consulServices := conf.ConsulServices.(*regMock.ServiceRegistrationHandler)
+	consulOpts := consulServices.GetOps()
 	var groupRemoveOp regMock.Operation
 	for _, op := range consulOpts {
 		// Grab the first deregistration request
@@ -1220,6 +1223,10 @@ func TestAllocRunner_TaskLeader_StopRestoredTG(t *testing.T) {
 	ar, err := NewAllocRunner(conf)
 	must.NoError(t, err)
 
+	// setup process wranglers for these tasks
+	ar.(*allocRunner).wranglers.Setup(proclib.Task{AllocID: alloc.ID, Task: task.Name})
+	ar.(*allocRunner).wranglers.Setup(proclib.Task{AllocID: alloc.ID, Task: task2.Name})
+
 	// Mimic Nomad exiting before the leader stopping is able to stop other tasks.
 	ar.(*allocRunner).tasks["leader"].UpdateState(structs.TaskStateDead, structs.NewTaskEvent(structs.TaskKilled))
 	ar.(*allocRunner).tasks["follower1"].UpdateState(structs.TaskStateRunning, structs.NewTaskEvent(structs.TaskStarted))
@@ -1273,6 +1280,13 @@ func TestAllocRunner_Restore_LifecycleHooks(t *testing.T) {
 	arIface, err := NewAllocRunner(conf)
 	must.NoError(t, err)
 	ar := arIface.(*allocRunner)
+
+	// Setup the process wranglers for the initial alloc runner, these should
+	// be recovered by the second alloc runner.
+	ar.wranglers.Setup(proclib.Task{AllocID: alloc.ID, Task: "init"})
+	ar.wranglers.Setup(proclib.Task{AllocID: alloc.ID, Task: "side"})
+	ar.wranglers.Setup(proclib.Task{AllocID: alloc.ID, Task: "web"})
+	ar.wranglers.Setup(proclib.Task{AllocID: alloc.ID, Task: "poststart"})
 
 	go ar.Run()
 	defer destroy(ar)
@@ -1524,8 +1538,8 @@ func TestAllocRunner_DeploymentHealth_Unhealthy_Checks(t *testing.T) {
 	defer cleanup()
 
 	// Only return the check as healthy after a duration
-	consulClient := conf.Consul.(*regMock.ServiceRegistrationHandler)
-	consulClient.AllocRegistrationsFn = func(allocID string) (*serviceregistration.AllocRegistration, error) {
+	consulServices := conf.ConsulServices.(*regMock.ServiceRegistrationHandler)
+	consulServices.AllocRegistrationsFn = func(allocID string) (*serviceregistration.AllocRegistration, error) {
 		return &serviceregistration.AllocRegistration{
 			Tasks: map[string]*serviceregistration.ServiceRegistrations{
 				task.Name: {
@@ -1630,8 +1644,8 @@ func TestAllocRunner_Destroy(t *testing.T) {
 	require.Nil(t, ts)
 
 	// Assert the alloc directory was cleaned
-	if _, err := os.Stat(ar.(*allocRunner).allocDir.AllocDir); err == nil {
-		require.Fail(t, "alloc dir still exists: %v", ar.(*allocRunner).allocDir.AllocDir)
+	if _, err := os.Stat(ar.(*allocRunner).allocDir.AllocDirPath()); err == nil {
+		require.Fail(t, "alloc dir still exists: %v", ar.(*allocRunner).allocDir.AllocDirPath())
 	} else if !os.IsNotExist(err) {
 		require.Failf(t, "expected NotExist error", "found %v", err)
 	}
@@ -1689,9 +1703,9 @@ func TestAllocRunner_MoveAllocDir(t *testing.T) {
 
 	// Step 2. Modify its directory
 	task := alloc.Job.TaskGroups[0].Tasks[0]
-	dataFile := filepath.Join(ar.GetAllocDir().SharedDir, "data", "data_file")
+	dataFile := filepath.Join(ar.GetAllocDir().ShareDirPath(), "data", "data_file")
 	os.WriteFile(dataFile, []byte("hello world"), os.ModePerm)
-	taskDir := ar.GetAllocDir().TaskDirs[task.Name]
+	taskDir := ar.GetAllocDir().GetTaskDir(task.Name)
 	taskLocalFile := filepath.Join(taskDir.LocalDir, "local_file")
 	os.WriteFile(taskLocalFile, []byte("good bye world"), os.ModePerm)
 
@@ -1716,11 +1730,11 @@ func TestAllocRunner_MoveAllocDir(t *testing.T) {
 	WaitForClientState(t, ar, structs.AllocClientStatusComplete)
 
 	// Ensure that data from ar was moved to ar2
-	dataFile = filepath.Join(ar2.GetAllocDir().SharedDir, "data", "data_file")
+	dataFile = filepath.Join(ar2.GetAllocDir().ShareDirPath(), "data", "data_file")
 	fileInfo, _ := os.Stat(dataFile)
 	require.NotNilf(t, fileInfo, "file %q not found", dataFile)
 
-	taskDir = ar2.GetAllocDir().TaskDirs[task.Name]
+	taskDir = ar2.GetAllocDir().GetTaskDir(task.Name)
 	taskLocalFile = filepath.Join(taskDir.LocalDir, "local_file")
 	fileInfo, _ = os.Stat(taskLocalFile)
 	require.NotNilf(t, fileInfo, "file %q not found", dataFile)
@@ -1851,8 +1865,8 @@ func TestAllocRunner_TaskFailed_KillTG(t *testing.T) {
 	conf, cleanup := testAllocRunnerConfig(t, alloc)
 	defer cleanup()
 
-	consulClient := conf.Consul.(*regMock.ServiceRegistrationHandler)
-	consulClient.AllocRegistrationsFn = func(allocID string) (*serviceregistration.AllocRegistration, error) {
+	consulServices := conf.ConsulServices.(*regMock.ServiceRegistrationHandler)
+	consulServices.AllocRegistrationsFn = func(allocID string) (*serviceregistration.AllocRegistration, error) {
 		return &serviceregistration.AllocRegistration{
 			Tasks: map[string]*serviceregistration.ServiceRegistrations{
 				task.Name: {
@@ -1976,8 +1990,8 @@ func TestAllocRunner_TerminalUpdate_Destroy(t *testing.T) {
 		}
 
 		// Check the alloc directory still exists
-		if _, err := os.Stat(ar.GetAllocDir().AllocDir); err != nil {
-			return false, fmt.Errorf("alloc dir destroyed: %v", ar.GetAllocDir().AllocDir)
+		if _, err := os.Stat(ar.GetAllocDir().AllocDirPath()); err != nil {
+			return false, fmt.Errorf("alloc dir destroyed: %v", ar.GetAllocDir().AllocDirPath())
 		}
 
 		return true, nil
@@ -2000,8 +2014,8 @@ func TestAllocRunner_TerminalUpdate_Destroy(t *testing.T) {
 		}
 
 		// Check the alloc directory was cleaned
-		if _, err := os.Stat(ar.GetAllocDir().AllocDir); err == nil {
-			return false, fmt.Errorf("alloc dir still exists: %v", ar.GetAllocDir().AllocDir)
+		if _, err := os.Stat(ar.GetAllocDir().AllocDirPath()); err == nil {
+			return false, fmt.Errorf("alloc dir still exists: %v", ar.GetAllocDir().AllocDirPath())
 		} else if !os.IsNotExist(err) {
 			return false, fmt.Errorf("stat err: %v", err)
 		}
@@ -2072,7 +2086,7 @@ func TestAllocRunner_PersistState_Destroyed(t *testing.T) {
 }
 
 func TestAllocRunner_Reconnect(t *testing.T) {
-	t.Parallel()
+	ci.Parallel(t)
 
 	type tcase struct {
 		clientStatus string
@@ -2519,4 +2533,32 @@ func TestAllocRunner_GetUpdatePriority(t *testing.T) {
 	ar.SetClientStatus(structs.AllocClientStatusFailed)
 	calloc = ar.clientAlloc(map[string]*structs.TaskState{})
 	must.Eq(t, cstructs.AllocUpdatePriorityUrgent, ar.GetUpdatePriority(calloc))
+}
+
+func TestAllocRunner_setHookStatsHandler(t *testing.T) {
+	ci.Parallel(t)
+
+	// Create an allocation runner that doesn't have any configuration, which
+	// means the operator has not disabled hook metrics.
+	baseAllocRunner := &allocRunner{
+		clientConfig:     &client.Config{},
+		clientBaseLabels: []metrics.Label{},
+	}
+
+	baseAllocRunner.setHookStatsHandler("platform")
+	handler, ok := baseAllocRunner.hookStatsHandler.(*hookstats.Handler)
+	must.True(t, ok)
+	must.NotNil(t, handler)
+
+	// Create a new allocation runner but explicitly disable hook metrics
+	// collection.
+	baseAllocRunner = &allocRunner{
+		clientConfig:     &client.Config{DisableAllocationHookMetrics: true},
+		clientBaseLabels: []metrics.Label{},
+	}
+
+	baseAllocRunner.setHookStatsHandler("platform")
+	noopHandler, ok := baseAllocRunner.hookStatsHandler.(*hookstats.NoOpHandler)
+	must.True(t, ok)
+	must.NotNil(t, noopHandler)
 }

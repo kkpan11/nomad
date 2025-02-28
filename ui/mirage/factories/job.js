@@ -1,6 +1,6 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 import { assign } from '@ember/polyfills';
@@ -175,6 +175,9 @@ export default Factory.extend({
   // When true, the job will have no versions or deployments (and in turn no latest deployment)
   noDeployments: false,
 
+  // When true, the job will have a previous stable version. Useful for testing "start job" loop.
+  withPreviousStableVersion: false,
+
   // When true, an evaluation with a high modify index and placement failures is created
   failedPlacements: false,
 
@@ -199,11 +202,24 @@ export default Factory.extend({
   // When true, only task groups and allocations are made
   shallow: false,
 
+  // When true, the job's groups' tasks will have actions blocks
+  withActions: false,
+
+  // When true, the job will simulate a "scheduled" block's paused state
+  withPausedTasks: false,
+
+  latestDeployment: null,
+
   afterCreate(job, server) {
+    Ember.assert(
+      '[Mirage] No node pools! make sure node pools are created before jobs',
+      server.db.nodePools.length
+    );
+
     if (!job.namespaceId) {
       const namespace = server.db.namespaces.length
         ? pickOne(server.db.namespaces).id
-        : null;
+        : 'default';
       job.update({
         namespace,
         namespaceId: namespace,
@@ -214,19 +230,31 @@ export default Factory.extend({
       });
     }
 
+    if (!job.nodePool) {
+      job.update({
+        nodePool: pickOne(server.db.nodePools).name,
+      });
+    }
+
     const groupProps = {
       job,
       createAllocations: job.createAllocations,
       withRescheduling: job.withRescheduling,
       withServices: job.withGroupServices,
       withTaskServices: job.withTaskServices,
+      withActions: job.withActions,
       createRecommendations: job.createRecommendations,
       shallow: job.shallow,
       allocStatusDistribution: job.allocStatusDistribution,
+      withPausedTasks: job.withPausedTasks,
     };
 
     if (job.groupTaskCount) {
-      groupProps.count = job.groupTaskCount;
+      groupProps.taskCount = job.groupTaskCount;
+    }
+
+    if (job.groupAllocCount !== undefined) {
+      groupProps.count = job.groupAllocCount;
     }
 
     let groups;
@@ -292,8 +320,32 @@ export default Factory.extend({
             version: index,
             noActiveDeployment: job.noActiveDeployment,
             activeDeployment: job.activeDeployment,
+            stable: true,
           });
         });
+
+      if (job.withPreviousStableVersion) {
+        server.create('job-version', {
+          job,
+          namespace: job.namespace,
+          version: 1,
+          noActiveDeployment: job.noActiveDeployment,
+          activeDeployment: job.activeDeployment,
+          stable: true,
+        });
+      }
+    }
+
+    if (job.activeDeployment) {
+      job.latestDeployment = {
+        IsActive: true,
+        Status: 'running',
+        StatusDescription: 'Deployment is running',
+        RequiresPromotion: false,
+        AllAutoPromote: true,
+        JobVersion: 1,
+        ID: faker.random.uuid(),
+      };
     }
 
     if (!job.shallow) {

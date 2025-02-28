@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package taskenv
 
@@ -12,10 +12,10 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/hashicorp/nomad/client/lib/idset"
 	"github.com/hashicorp/nomad/helper"
 	hargs "github.com/hashicorp/nomad/helper/args"
 	"github.com/hashicorp/nomad/helper/escapingfs"
-	"github.com/hashicorp/nomad/lib/cpuset"
 	"github.com/hashicorp/nomad/nomad/structs"
 	"github.com/hashicorp/nomad/plugins/drivers"
 	"github.com/zclconf/go-cty/cty"
@@ -120,6 +120,11 @@ const (
 	// UpstreamPrefix is the prefix for passing upstream IP and ports to the alloc
 	UpstreamPrefix = "NOMAD_UPSTREAM_"
 
+	// AllocPrefix is a general purpose alloc prefix. It is currently used as
+	// the env var prefix used to export network namespace information
+	// including IP, Port, and interface.
+	AllocPrefix = "NOMAD_ALLOC_"
+
 	// VaultToken is the environment variable for passing the Vault token
 	VaultToken = "VAULT_TOKEN"
 
@@ -137,6 +142,7 @@ const (
 	nodeRegionKey = "node.region"
 	nodeNameKey   = "node.unique.name"
 	nodeClassKey  = "node.class"
+	nodePoolKey   = "node.pool"
 
 	// Prefixes used for lookups.
 	nodeAttributePrefix = "attr."
@@ -412,27 +418,27 @@ type Builder struct {
 	// clientTaskSecretsDir is the secrets dir from the client's perspective; eg <client_task_root>/secrets
 	clientTaskSecretsDir string
 
-	cpuCores            string
-	cpuLimit            int64
-	memLimit            int64
-	memMaxLimit         int64
-	taskName            string
-	allocIndex          int
-	datacenter          string
-	cgroupParent        string
-	namespace           string
-	region              string
-	allocId             string
-	allocName           string
-	groupName           string
-	vaultToken          string
-	vaultNamespace      string
-	injectVaultToken    bool
-	workloadToken       string
-	injectWorkloadToken bool
-	jobID               string
-	jobName             string
-	jobParentID         string
+	cpuCores             string
+	cpuLimit             int64
+	memLimit             int64
+	memMaxLimit          int64
+	taskName             string
+	allocIndex           int
+	datacenter           string
+	cgroupParent         string
+	namespace            string
+	region               string
+	allocId              string
+	allocName            string
+	groupName            string
+	vaultToken           string
+	vaultNamespace       string
+	injectVaultToken     bool
+	workloadTokenDefault string
+	workloadTokens       map[string]string // identity name -> encoded JWT
+	jobID                string
+	jobName              string
+	jobParentID          string
 
 	// otherPorts for tasks in the same alloc
 	otherPorts map[string]string
@@ -445,6 +451,9 @@ type Builder struct {
 	// because portMaps and advertiseIP can change after builder creation
 	// and affect network env vars.
 	networks []*structs.NetworkResource
+
+	networkStatus  *structs.AllocNetworkStatus
+	allocatedPorts structs.AllocatedPorts
 
 	// hookEnvs are env vars set by hooks and stored by hook name to
 	// support adding/removing vars from multiple hooks (eg HookA adds A:1,
@@ -565,6 +574,12 @@ func (b *Builder) buildEnv(allocDir, localDir, secretsDir string,
 	// Build the Consul Connect upstream env vars
 	buildUpstreamsEnv(envMap, b.upstreams)
 
+	// Build the network namespace information if we have the required detail
+	// available.
+	if b.networkStatus != nil && b.allocatedPorts != nil {
+		addNomadAllocNetwork(envMap, b.allocatedPorts, b.networkStatus)
+	}
+
 	// Build the Vault Token
 	if b.injectVaultToken && b.vaultToken != "" {
 		envMap[VaultToken] = b.vaultToken
@@ -576,8 +591,12 @@ func (b *Builder) buildEnv(allocDir, localDir, secretsDir string,
 	}
 
 	// Build the Nomad Workload Token
-	if b.injectWorkloadToken && b.workloadToken != "" {
-		envMap[WorkloadToken] = b.workloadToken
+	if b.workloadTokenDefault != "" {
+		envMap[WorkloadToken] = b.workloadTokenDefault
+	}
+
+	for name, token := range b.workloadTokens {
+		envMap[WorkloadToken+"_"+name] = token
 	}
 
 	// Copy and interpolate task meta
@@ -769,7 +788,7 @@ func (b *Builder) setAlloc(alloc *structs.Allocation) *Builder {
 		// Populate task resources
 		if tr, ok := alloc.AllocatedResources.Tasks[b.taskName]; ok {
 			b.cpuLimit = tr.Cpu.CpuShares
-			b.cpuCores = cpuset.New(tr.Cpu.ReservedCores...).String()
+			b.cpuCores = idset.From[uint16](tr.Cpu.ReservedCores).String()
 			b.memLimit = tr.Memory.MemoryMB
 			b.memMaxLimit = tr.Memory.MemoryMaxMB
 
@@ -812,6 +831,7 @@ func (b *Builder) setAlloc(alloc *structs.Allocation) *Builder {
 
 		// Add any allocated host ports
 		if alloc.AllocatedResources.Shared.Ports != nil {
+			b.allocatedPorts = alloc.AllocatedResources.Shared.Ports
 			addPorts(b.otherPorts, alloc.AllocatedResources.Shared.Ports)
 		}
 	}
@@ -836,6 +856,7 @@ func (b *Builder) setNode(n *structs.Node) *Builder {
 	b.nodeAttrs[nodeNameKey] = n.Name
 	b.nodeAttrs[nodeClassKey] = n.NodeClass
 	b.nodeAttrs[nodeDcKey] = n.Datacenter
+	b.nodeAttrs[nodePoolKey] = n.NodePool
 	b.datacenter = n.Datacenter
 	b.cgroupParent = n.CgroupParent
 
@@ -931,7 +952,16 @@ func buildNetworkEnv(envMap map[string]string, nets structs.Networks, driverNet 
 func buildPortEnv(envMap map[string]string, p structs.Port, ip string, driverNet *drivers.DriverNetwork) {
 	// Host IP, port, and address
 	portStr := strconv.Itoa(p.Value)
+
+	var ipFamilyPrefix string
+	if strings.Contains(ip, ":") {
+		ipFamilyPrefix = "NOMAD_IPv6_"
+	} else {
+		ipFamilyPrefix = "NOMAD_IPv4_"
+	}
+
 	envMap[IpPrefix+p.Label] = ip
+	envMap[ipFamilyPrefix+p.Label] = ip
 	envMap[HostPortPrefix+p.Label] = portStr
 	envMap[AddrPrefix+p.Label] = net.JoinHostPort(ip, portStr)
 
@@ -956,6 +986,13 @@ func (b *Builder) setUpstreamsLocked(upstreams []structs.ConsulUpstream) *Builde
 	return b
 }
 
+func (b *Builder) SetNetworkStatus(netStatus *structs.AllocNetworkStatus) *Builder {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.networkStatus = netStatus
+	return b
+}
+
 // buildUpstreamsEnv builds NOMAD_UPSTREAM_{IP,PORT,ADDR}_{destination} vars
 func buildUpstreamsEnv(envMap map[string]string, upstreams []structs.ConsulUpstream) {
 	// Proxy sidecars always bind to localhost
@@ -971,6 +1008,18 @@ func buildUpstreamsEnv(envMap map[string]string, upstreams []structs.ConsulUpstr
 		envMap[UpstreamPrefix+"ADDR_"+cleanName] = net.JoinHostPort(ip, port)
 		envMap[UpstreamPrefix+"IP_"+cleanName] = ip
 		envMap[UpstreamPrefix+"PORT_"+cleanName] = port
+	}
+}
+
+// addNomadAllocNetwork builds NOMAD_ALLOC_{IP,INTERFACE,ADDR}_{port_label}
+// vars. NOMAD_ALLOC_PORT_* is handled within addPorts and therefore omitted
+// from this function.
+func addNomadAllocNetwork(envMap map[string]string, p structs.AllocatedPorts, netStatus *structs.AllocNetworkStatus) {
+	for _, allocatedPort := range p {
+		portStr := strconv.Itoa(allocatedPort.To)
+		envMap[AllocPrefix+"INTERFACE_"+allocatedPort.Label] = netStatus.InterfaceName
+		envMap[AllocPrefix+"IP_"+allocatedPort.Label] = netStatus.Address
+		envMap[AllocPrefix+"ADDR_"+allocatedPort.Label] = net.JoinHostPort(netStatus.Address, portStr)
 	}
 }
 
@@ -1031,10 +1080,19 @@ func (b *Builder) SetVaultToken(token, namespace string, inject bool) *Builder {
 	return b
 }
 
-func (b *Builder) SetWorkloadToken(token string, inject bool) *Builder {
+func (b *Builder) SetDefaultWorkloadToken(token string) *Builder {
 	b.mu.Lock()
-	b.workloadToken = token
-	b.injectWorkloadToken = inject
+	b.workloadTokenDefault = token
+	b.mu.Unlock()
+	return b
+}
+
+func (b *Builder) SetWorkloadToken(name, token string) *Builder {
+	b.mu.Lock()
+	if b.workloadTokens == nil {
+		b.workloadTokens = map[string]string{}
+	}
+	b.workloadTokens[name] = token
 	b.mu.Unlock()
 	return b
 }

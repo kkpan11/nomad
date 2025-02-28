@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 //go:build windows
 
@@ -11,7 +11,7 @@ import (
 )
 
 // lockdown is not implemented on Windows
-func lockdown(string, string) error {
+func lockdown(string, string, []string) error {
 	return nil
 }
 

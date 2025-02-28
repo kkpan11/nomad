@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package nomad
 
@@ -13,9 +13,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/armon/go-metrics"
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/go-memdb"
+	metrics "github.com/hashicorp/go-metrics/compat"
 	"github.com/hashicorp/go-version"
 	"github.com/hashicorp/nomad/helper"
 	"github.com/hashicorp/nomad/helper/uuid"
@@ -58,7 +58,7 @@ var minACLRoleVersion = version.Must(version.NewVersion("1.4.0"))
 // minACLAuthMethodVersion is the Nomad version at which the ACL auth methods
 // table was introduced. It forms the minimum version all federated servers must
 // meet before the feature can be used.
-var minACLAuthMethodVersion = version.Must(version.NewVersion("1.5.0-beta.1"))
+var minACLAuthMethodVersion = version.Must(version.NewVersion("1.5.0"))
 
 // minACLJWTAuthMethodVersion is the Nomad version at which the ACL JWT auth method type
 // was introduced. It forms the minimum version all federated servers must
@@ -68,12 +68,21 @@ var minACLJWTAuthMethodVersion = version.Must(version.NewVersion("1.5.4"))
 // minACLBindingRuleVersion is the Nomad version at which the ACL binding rules
 // table was introduced. It forms the minimum version all federated servers
 // must meet before the feature can be used.
-var minACLBindingRuleVersion = version.Must(version.NewVersion("1.5.0-beta.1"))
+var minACLBindingRuleVersion = version.Must(version.NewVersion("1.5.0"))
 
 // minNomadServiceRegistrationVersion is the Nomad version at which the service
 // registrations table was introduced. It forms the minimum version all local
 // servers must meet before the feature can be used.
 var minNomadServiceRegistrationVersion = version.Must(version.NewVersion("1.3.0"))
+
+// Any writes to node pools requires that all servers are on version 1.6.0 to
+// prevent older versions of the server from crashing.
+var minNodePoolsVersion = version.Must(version.NewVersion("1.6.0"))
+
+// minVersionMultiIdentities is the Nomad version at which users can add
+// multiple identity blocks to tasks and workload identities can be
+// automatically added to jobs that need access to Consul or Vault
+var minVersionMultiIdentities = version.Must(version.NewVersion("1.7.0"))
 
 // monitorLeadership is used to monitor if we acquire or lose our role
 // as the leader in the Raft cluster. There is some work the leader is
@@ -143,6 +152,50 @@ func (s *Server) monitorLeadership() {
 			return
 		}
 	}
+}
+
+func (s *Server) leadershipTransferToServer(to structs.RaftIDAddress) error {
+	if l := structs.NewRaftIDAddress(s.raft.LeaderWithID()); l == to {
+		s.logger.Debug("leadership transfer to current leader is a no-op")
+		return nil
+	}
+	retryCount := 3
+	var lastError error
+	for i := 0; i < retryCount; i++ {
+		err := s.raft.LeadershipTransferToServer(to.ID, to.Address).Error()
+		if err == nil {
+			s.logger.Info("successfully transferred leadership")
+			return nil
+		}
+
+		// "cannot transfer leadership to itself"
+		// Handled at top of function, but reapplied here to prevent retrying if
+		// it occurs while we are retrying
+		if err.Error() == "cannot transfer leadership to itself" {
+			s.logger.Debug("leadership transfer to current leader is a no-op")
+			return nil
+		}
+
+		// ErrRaftShutdown: Don't retry if raft is shut down.
+		if err == raft.ErrRaftShutdown {
+			return err
+		}
+
+		// ErrUnsupportedProtocol: Don't retry if the Raft version doesn't
+		// support leadership transfer since this will never succeed.
+		if err == raft.ErrUnsupportedProtocol {
+			return fmt.Errorf("leadership transfer not supported with Raft version lower than 3")
+		}
+
+		// ErrEnqueueTimeout: This seems to be the valid time to retry.
+		s.logger.Error("failed to transfer leadership attempt, will retry",
+			"attempt", i,
+			"retry_limit", retryCount,
+			"error", err,
+		)
+		lastError = err
+	}
+	return fmt.Errorf("failed to transfer leadership in %d attempts. last error: %w", retryCount, lastError)
 }
 
 func (s *Server) leadershipTransfer() error {
@@ -319,9 +372,11 @@ func (s *Server) establishLeadership(stopCh chan struct{}) error {
 	// Initialize scheduler configuration.
 	schedulerConfig := s.getOrCreateSchedulerConfig()
 
-	// Initialize the ClusterID
-	_, _ = s.ClusterID()
-	// todo: use cluster ID for stuff, later!
+	// Initialize the Cluster metadata
+	clusterMetadata, err := s.ClusterMetadata()
+	if err != nil {
+		return err
+	}
 
 	// Enable the plan queue, since we are now the leader
 	s.planQueue.SetEnabled(true)
@@ -349,9 +404,6 @@ func (s *Server) establishLeadership(stopCh chan struct{}) error {
 			return err
 		}
 	}
-
-	// Activate the vault client
-	s.vault.SetActive(true)
 
 	// Enable the periodic dispatcher, since we are now the leader.
 	s.periodicDispatcher.SetEnabled(true)
@@ -393,6 +445,17 @@ func (s *Server) establishLeadership(stopCh chan struct{}) error {
 	// Periodically publish job status metrics
 	go s.publishJobStatusMetrics(stopCh)
 
+	// Populate the variable lock TTL timers, so we can start tracking renewals
+	// and expirations.
+	if err := s.restoreLockTTLTimers(); err != nil {
+		return err
+	}
+
+	// Periodically publish metrics for the lock timer trackers which are only
+	// run on the leader.
+	go s.lockTTLTimer.EmitMetrics(1*time.Second, stopCh)
+	go s.lockDelayTimer.EmitMetrics(1*time.Second, stopCh)
+
 	// Setup the heartbeat timers. This is done both when starting up or when
 	// a leader fail over happens. Since the timers are maintained by the leader
 	// node, effectively this means all the timers are renewed at the time of failover.
@@ -425,16 +488,12 @@ func (s *Server) establishLeadership(stopCh chan struct{}) error {
 			go s.replicateACLAuthMethods(stopCh)
 			go s.replicateACLBindingRules(stopCh)
 			go s.replicateNamespaces(stopCh)
+			go s.replicateNodePools(stopCh)
 		}
 	}
 
 	// Setup any enterprise systems required.
-	if err := s.establishEnterpriseLeadership(stopCh); err != nil {
-		return err
-	}
-
-	// Cleanup orphaned Vault token accessors
-	if err := s.revokeVaultAccessorsOnRestore(); err != nil {
+	if err := s.establishEnterpriseLeadership(stopCh, clusterMetadata); err != nil {
 		return err
 	}
 
@@ -596,6 +655,146 @@ func diffNamespaces(state *state.StateStore, minIndex uint64, remoteList []*stru
 	return
 }
 
+// replicateNodePools is used to replicate node pools from the authoritative
+// region to this region.
+func (s *Server) replicateNodePools(stopCh chan struct{}) {
+	req := structs.NodePoolListRequest{
+		QueryOptions: structs.QueryOptions{
+			Region:     s.config.AuthoritativeRegion,
+			AllowStale: true,
+		},
+	}
+	limiter := rate.NewLimiter(replicationRateLimit, int(replicationRateLimit))
+	s.logger.Debug("starting node pool replication from authoritative region", "region", req.Region)
+
+	for {
+		select {
+		case <-stopCh:
+			return
+		default:
+		}
+
+		// Rate limit how often we attempt replication
+		limiter.Wait(context.Background())
+
+		if !ServersMeetMinimumVersion(
+			s.serf.Members(), s.Region(), minNodePoolsVersion, true) {
+			s.logger.Trace(
+				"all servers must be upgraded to 1.6.0 before Node Pools can be replicated")
+			if s.replicationBackoffContinue(stopCh) {
+				continue
+			} else {
+				return
+			}
+		}
+
+		var resp structs.NodePoolListResponse
+		req.AuthToken = s.ReplicationToken()
+		err := s.forwardRegion(s.config.AuthoritativeRegion, "NodePool.List", &req, &resp)
+		if err != nil {
+			s.logger.Error("failed to fetch node pools from authoritative region", "error", err)
+			if s.replicationBackoffContinue(stopCh) {
+				continue
+			} else {
+				return
+			}
+		}
+
+		// Perform a two-way diff
+		delete, update := diffNodePools(s.State(), req.MinQueryIndex, resp.NodePools)
+
+		// A significant amount of time could pass between the last check
+		// on whether we should stop the replication process. Therefore, do
+		// a check here, before calling Raft.
+		select {
+		case <-stopCh:
+			return
+		default:
+		}
+
+		// Delete node pools that should not exist
+		if len(delete) > 0 {
+			args := &structs.NodePoolDeleteRequest{
+				Names: delete,
+			}
+			_, _, err := s.raftApply(structs.NodePoolDeleteRequestType, args)
+			if err != nil {
+				s.logger.Error("failed to delete node pools", "error", err)
+				if s.replicationBackoffContinue(stopCh) {
+					continue
+				} else {
+					return
+				}
+			}
+		}
+
+		// Update local node pools
+		if len(update) > 0 {
+			args := &structs.NodePoolUpsertRequest{
+				NodePools: update,
+			}
+			_, _, err := s.raftApply(structs.NodePoolUpsertRequestType, args)
+			if err != nil {
+				s.logger.Error("failed to update node pools", "error", err)
+				if s.replicationBackoffContinue(stopCh) {
+					continue
+				} else {
+					return
+				}
+			}
+		}
+
+		// Update the minimum query index, blocks until there is a change.
+		req.MinQueryIndex = resp.Index
+	}
+}
+
+// diffNodePools is used to perform a two-way diff between the local node pools
+// and the remote node pools to determine which node pools need to be deleted or
+// updated.
+func diffNodePools(store *state.StateStore, minIndex uint64, remoteList []*structs.NodePool) (delete []string, update []*structs.NodePool) {
+	// Construct a set of the local and remote node pools
+	local := make(map[string][]byte)
+	remote := make(map[string]struct{})
+
+	// Add all the local node pools
+	iter, err := store.NodePools(nil, state.SortDefault)
+	if err != nil {
+		panic("failed to iterate local node pools")
+	}
+	for {
+		raw := iter.Next()
+		if raw == nil {
+			break
+		}
+		pool := raw.(*structs.NodePool)
+		local[pool.Name] = pool.Hash
+	}
+
+	for _, rnp := range remoteList {
+		remote[rnp.Name] = struct{}{}
+
+		if localHash, ok := local[rnp.Name]; !ok {
+			// Node pools that are missing locally should be added
+			update = append(update, rnp)
+
+		} else if rnp.ModifyIndex > minIndex && !bytes.Equal(localHash, rnp.Hash) {
+			// Node pools that have been added/updated more recently than the
+			// last index we saw, and have a hash mismatch with what we have
+			// locally, should be updated.
+			update = append(update, rnp)
+		}
+	}
+
+	// Node pools that don't exist on the remote should be deleted
+	for lnp := range local {
+		if _, ok := remote[lnp]; !ok {
+			delete = append(delete, lnp)
+		}
+	}
+	return
+}
+
 // restoreEvals is used to restore pending evaluations into the eval broker and
 // blocked evaluations into the blocked eval tracker. The broker and blocked
 // eval tracker is maintained only by the leader, so it must be restored anytime
@@ -616,65 +815,11 @@ func (s *Server) restoreEvals() error {
 		eval := raw.(*structs.Evaluation)
 
 		if eval.ShouldEnqueue() {
-			s.evalBroker.Enqueue(eval)
+			s.evalBroker.Restore(eval)
 		} else if eval.ShouldBlock() {
 			s.blockedEvals.Block(eval)
 		}
 	}
-	return nil
-}
-
-// revokeVaultAccessorsOnRestore is used to restore Vault accessors that should be
-// revoked.
-func (s *Server) revokeVaultAccessorsOnRestore() error {
-	// An accessor should be revoked if its allocation or node is terminal
-	ws := memdb.NewWatchSet()
-	state := s.fsm.State()
-	iter, err := state.VaultAccessors(ws)
-	if err != nil {
-		return fmt.Errorf("failed to get vault accessors: %v", err)
-	}
-
-	var revoke []*structs.VaultAccessor
-	for {
-		raw := iter.Next()
-		if raw == nil {
-			break
-		}
-
-		va := raw.(*structs.VaultAccessor)
-
-		// Check the allocation
-		alloc, err := state.AllocByID(ws, va.AllocID)
-		if err != nil {
-			return fmt.Errorf("failed to lookup allocation %q: %v", va.AllocID, err)
-		}
-		if alloc == nil || alloc.Terminated() {
-			// No longer running and should be revoked
-			revoke = append(revoke, va)
-			continue
-		}
-
-		// Check the node
-		node, err := state.NodeByID(ws, va.NodeID)
-		if err != nil {
-			return fmt.Errorf("failed to lookup node %q: %v", va.NodeID, err)
-		}
-		if node == nil || node.TerminalStatus() {
-			// Node is terminal so any accessor from it should be revoked
-			revoke = append(revoke, va)
-			continue
-		}
-	}
-
-	if len(revoke) != 0 {
-		s.logger.Info("revoking vault accessors after becoming leader", "accessors", len(revoke))
-
-		if err := s.vault.MarkForRevocation(revoke); err != nil {
-			return fmt.Errorf("failed to revoke tokens: %v", err)
-		}
-	}
-
 	return nil
 }
 
@@ -1231,13 +1376,13 @@ func (s *Server) publishJobStatusMetrics(stopCh chan struct{}) {
 			return
 		case <-timer.C:
 			timer.Reset(s.config.StatsCollectionInterval)
-			state, err := s.State().Snapshot()
+			snap, err := s.State().Snapshot()
 			if err != nil {
 				s.logger.Error("failed to get state", "error", err)
 				continue
 			}
 			ws := memdb.NewWatchSet()
-			iter, err := state.Jobs(ws)
+			iter, err := snap.Jobs(ws, state.SortDefault)
 			if err != nil {
 				s.logger.Error("failed to get job statuses", "error", err)
 				continue
@@ -1303,9 +1448,6 @@ func (s *Server) revokeLeadership() error {
 	// Disable the periodic dispatcher, since it is only useful as a leader
 	s.periodicDispatcher.SetEnabled(false)
 
-	// Disable the Vault client as it is only useful as a leader.
-	s.vault.SetActive(false)
-
 	// Disable the deployment watcher as it is only useful as a leader.
 	s.deploymentWatcher.SetEnabled(false, nil)
 
@@ -1319,6 +1461,10 @@ func (s *Server) revokeLeadership() error {
 	if err := s.revokeEnterpriseLeadership(); err != nil {
 		return err
 	}
+
+	// Stop all the tracked variable lock TTL and delay timers.
+	s.lockTTLTimer.StopAndRemoveAll()
+	s.lockDelayTimer.RemoveAll()
 
 	// Clear the heartbeat timers on either shutdown or step down,
 	// since we are no longer responsible for TTL expirations.
@@ -1848,6 +1994,17 @@ func (s *Server) replicateACLRoles(stopCh chan struct{}) {
 			// parameters are controlled internally.
 			_ = limiter.Wait(context.Background())
 
+			if !ServersMeetMinimumVersion(
+				s.serf.Members(), s.Region(), minACLRoleVersion, true) {
+				s.logger.Trace(
+					"all servers must be upgraded to 1.4.0 or later before ACL Roles can be replicated")
+				if s.replicationBackoffContinue(stopCh) {
+					continue
+				} else {
+					return
+				}
+			}
+
 			// Set the replication token on each replication iteration so that
 			// it is always current and can handle agent SIGHUP reloads.
 			req.AuthToken = s.ReplicationToken()
@@ -2046,6 +2203,17 @@ func (s *Server) replicateACLAuthMethods(stopCh chan struct{}) {
 			// parameters are controlled internally.
 			_ = limiter.Wait(context.Background())
 
+			if !ServersMeetMinimumVersion(
+				s.serf.Members(), s.Region(), minACLAuthMethodVersion, true) {
+				s.logger.Trace(
+					"all servers must be upgraded to 1.5.0 or later before ACL Auth Methods can be replicated")
+				if s.replicationBackoffContinue(stopCh) {
+					continue
+				} else {
+					return
+				}
+			}
+
 			// Set the replication token on each replication iteration so that
 			// it is always current and can handle agent SIGHUP reloads.
 			req.AuthToken = s.ReplicationToken()
@@ -2240,6 +2408,17 @@ func (s *Server) replicateACLBindingRules(stopCh chan struct{}) {
 			// the error as the context will never be cancelled and the limit
 			// parameters are controlled internally.
 			_ = limiter.Wait(context.Background())
+
+			if !ServersMeetMinimumVersion(
+				s.serf.Members(), s.Region(), minACLBindingRuleVersion, true) {
+				s.logger.Trace(
+					"all servers must be upgraded to 1.5.0 or later before ACL Binding Rules can be replicated")
+				if s.replicationBackoffContinue(stopCh) {
+					continue
+				} else {
+					return
+				}
+			}
 
 			// Set the replication token on each replication iteration so that
 			// it is always current and can handle agent SIGHUP reloads.
@@ -2477,6 +2656,7 @@ func (s *Server) getOrCreateSchedulerConfig() *structs.SchedulerConfiguration {
 }
 
 var minVersionKeyring = version.Must(version.NewVersion("1.4.0"))
+var minVersionKeyringInRaft = version.Must(version.NewVersion("1.9.0-dev"))
 
 // initializeKeyring creates the first root key if the leader doesn't
 // already have one. The metadata will be replicated via raft and then
@@ -2487,12 +2667,12 @@ func (s *Server) initializeKeyring(stopCh <-chan struct{}) {
 	logger := s.logger.Named("keyring")
 
 	store := s.fsm.State()
-	keyMeta, err := store.GetActiveRootKeyMeta(nil)
+	key, err := store.GetActiveRootKey(nil)
 	if err != nil {
 		logger.Error("failed to get active key: %v", err)
 		return
 	}
-	if keyMeta != nil {
+	if key != nil {
 		return
 	}
 
@@ -2515,44 +2695,58 @@ func (s *Server) initializeKeyring(stopCh <-chan struct{}) {
 
 	logger.Trace("initializing keyring")
 
-	rootKey, err := structs.NewRootKey(structs.EncryptionAlgorithmAES256GCM)
-	rootKey.Meta.SetActive()
+	rootKey, err := structs.NewUnwrappedRootKey(structs.EncryptionAlgorithmAES256GCM)
+	rootKey = rootKey.MakeActive()
 	if err != nil {
 		logger.Error("could not initialize keyring: %v", err)
 		return
 	}
 
-	err = s.encrypter.AddKey(rootKey)
+	isClusterUpgraded := ServersMeetMinimumVersion(
+		s.serf.Members(), s.Region(), minVersionKeyringInRaft, true)
+
+	wrappedKeys, err := s.encrypter.AddUnwrappedKey(rootKey, isClusterUpgraded)
 	if err != nil {
-		logger.Error("could not add initial key to keyring: %v", err)
+		logger.Error("could not add initial key to keyring", "error", err)
 		return
 	}
-
-	if _, _, err = s.raftApply(structs.RootKeyMetaUpsertRequestType,
-		structs.KeyringUpdateRootKeyMetaRequest{
-			RootKeyMeta: rootKey.Meta,
-		}); err != nil {
-		logger.Error("could not initialize keyring: %v", err)
-		return
+	if isClusterUpgraded {
+		if _, _, err = s.raftApply(structs.WrappedRootKeysUpsertRequestType,
+			structs.KeyringUpsertWrappedRootKeyRequest{
+				WrappedRootKeys: wrappedKeys,
+			}); err != nil {
+			logger.Error("could not initialize keyring", "error", err)
+			return
+		}
+	} else {
+		logger.Warn(fmt.Sprintf("not all servers are >=%q; initializing legacy keyring",
+			minVersionKeyringInRaft))
+		if _, _, err = s.raftApply(structs.RootKeyMetaUpsertRequestType,
+			structs.KeyringUpdateRootKeyMetaRequest{
+				RootKeyMeta: rootKey.Meta,
+			}); err != nil {
+			logger.Error("could not initialize keyring", "error", err)
+			return
+		}
 	}
 
 	logger.Info("initialized keyring", "id", rootKey.Meta.KeyID)
 }
 
-func (s *Server) generateClusterID() (string, error) {
+func (s *Server) generateClusterMetadata() (structs.ClusterMetadata, error) {
 	if !ServersMeetMinimumVersion(s.Members(), AllRegions, minClusterIDVersion, false) {
 		s.logger.Named("core").Warn("cannot initialize cluster ID until all servers are above minimum version", "min_version", minClusterIDVersion)
-		return "", fmt.Errorf("cluster ID cannot be created until all servers are above minimum version %s", minClusterIDVersion)
+		return structs.ClusterMetadata{}, fmt.Errorf("cluster ID cannot be created until all servers are above minimum version %s", minClusterIDVersion)
 	}
 
 	newMeta := structs.ClusterMetadata{ClusterID: uuid.Generate(), CreateTime: time.Now().UnixNano()}
 	if _, _, err := s.raftApply(structs.ClusterMetadataRequestType, newMeta); err != nil {
 		s.logger.Named("core").Error("failed to create cluster ID", "error", err)
-		return "", fmt.Errorf("failed to create cluster ID: %w", err)
+		return structs.ClusterMetadata{}, fmt.Errorf("failed to create cluster ID: %w", err)
 	}
 
 	s.logger.Named("core").Info("established cluster id", "cluster_id", newMeta.ClusterID, "create_time", newMeta.CreateTime)
-	return newMeta.ClusterID, nil
+	return newMeta, nil
 }
 
 // handleEvalBrokerStateChange handles changing the evalBroker and blockedEvals
@@ -2613,10 +2807,6 @@ func (s *Server) handleEvalBrokerStateChange(schedConfig *structs.SchedulerConfi
 		s.logger.Info("blocked evals status modified", "paused", !enableBrokers)
 		s.blockedEvals.SetEnabled(enableBrokers)
 		restoreEvals = enableBrokers
-
-		if enableBrokers {
-			s.blockedEvals.SetTimetable(s.fsm.TimeTable())
-		}
 	}
 
 	return restoreEvals

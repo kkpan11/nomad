@@ -1,6 +1,6 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 /* eslint-disable ember/no-observers */
@@ -163,6 +163,9 @@ export default class IndexController extends Controller.extend(Sortable) {
 
   @action
   taskClick(allocation, task, event) {
+    if (!(event instanceof Event)) {
+      event = null;
+    }
     lazyClick([() => this.send('gotoTask', allocation, task), event]);
   }
 

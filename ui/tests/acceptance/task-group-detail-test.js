@@ -1,6 +1,6 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 /* eslint-disable qunit/require-expect */
@@ -35,6 +35,7 @@ module('Acceptance | task group detail', function (hooks) {
 
   hooks.beforeEach(async function () {
     server.create('agent');
+    server.create('node-pool');
     server.create('node', 'forceIPv4');
 
     job = server.create('job', {
@@ -126,9 +127,8 @@ module('Acceptance | task group detail', function (hooks) {
       'Aggregated Disk reservation for all tasks'
     );
 
-    assert.equal(
-      document.title,
-      `Task group ${taskGroup.name} - Job ${job.name} - Mirage - Nomad`
+    assert.ok(
+      document.title.includes(`Task group ${taskGroup.name} - Job ${job.name}`)
     );
   });
 
@@ -406,7 +406,7 @@ module('Acceptance | task group detail', function (hooks) {
   test('/jobs/:id/:task-group should present task lifecycles', async function (assert) {
     job = server.create('job', {
       groupsCount: 2,
-      groupTaskCount: 3,
+      groupAllocCount: 3,
     });
 
     const taskGroups = server.db.taskGroups.where({ jobId: job.id });
@@ -451,6 +451,19 @@ module('Acceptance | task group detail', function (hooks) {
     await TaskGroup.visit({ id: job.id, name: taskGroup.name });
 
     assert.notOk(TaskGroup.hasVolumes);
+  });
+
+  test('when the task group has metadata, the metadata table is shown', async function (assert) {
+    job = server.create('job', {
+      meta: { raw: { a: 'b' } },
+    });
+    taskGroup = server.create('task-group', {
+      job,
+      meta: { raw: { foo: 'bar' } },
+    });
+    await TaskGroup.visit({ id: job.id, name: taskGroup.name });
+
+    assert.ok(TaskGroup.hasMeta);
   });
 
   test('each row in the volumes table lists information about the volume', async function (assert) {

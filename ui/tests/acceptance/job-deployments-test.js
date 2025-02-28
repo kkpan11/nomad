@@ -1,6 +1,6 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 import { currentURL } from '@ember/test-helpers';
@@ -24,6 +24,7 @@ module('Acceptance | job deployments', function (hooks) {
   setupMirage(hooks);
 
   hooks.beforeEach(function () {
+    server.create('node-pool');
     server.create('node');
     job = server.create('job');
     deployments = server.schema.deployments.where({ jobId: job.id });

@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package structs
 
@@ -22,6 +22,7 @@ const (
 	Plugins         Context = "plugins"
 	Variables       Context = "vars"
 	Volumes         Context = "volumes"
+	HostVolumes     Context = "host_volumes"
 
 	// Subtypes used in fuzzy matching.
 	Groups   Context = "groups"

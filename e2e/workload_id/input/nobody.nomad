@@ -1,5 +1,5 @@
 # Copyright (c) HashiCorp, Inc.
-# SPDX-License-Identifier: MPL-2.0
+# SPDX-License-Identifier: BUSL-1.1
 
 job "nobodyid" {
   datacenters = ["dc1"]
@@ -24,7 +24,7 @@ job "nobodyid" {
 
       config {
         image = "bash:5"
-        args  = ["-c", "stat -c 'perms=%#a username=%U' secrets/nomad_token; echo done"]
+        args  = ["-c", "stat -c 'perms=%#a username=%U' secrets/nomad_token; echo done; sleep 2"]
       }
       resources {
         cpu    = 16

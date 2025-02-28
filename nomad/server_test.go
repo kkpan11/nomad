@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package nomad
 
@@ -11,10 +11,9 @@ import (
 	"testing"
 	"time"
 
-	msgpackrpc "github.com/hashicorp/net-rpc-msgpackrpc"
+	msgpackrpc "github.com/hashicorp/net-rpc-msgpackrpc/v2"
 	"github.com/hashicorp/nomad/ci"
 	"github.com/hashicorp/nomad/helper/testlog"
-	"github.com/hashicorp/nomad/helper/uuid"
 	"github.com/hashicorp/nomad/nomad/mock"
 	"github.com/hashicorp/nomad/nomad/structs"
 	"github.com/hashicorp/nomad/nomad/structs/config"
@@ -200,37 +199,6 @@ func TestServer_Regions(t *testing.T) {
 	}, func(err error) {
 		t.Fatalf("err: %v", err)
 	})
-}
-
-func TestServer_Reload_Vault(t *testing.T) {
-	ci.Parallel(t)
-
-	s1, cleanupS1 := TestServer(t, func(c *Config) {
-		c.Region = "global"
-	})
-	defer cleanupS1()
-
-	if s1.vault.Running() {
-		t.Fatalf("Vault client should not be running")
-	}
-
-	tr := true
-	config := DefaultConfig()
-	config.VaultConfig.Enabled = &tr
-	config.VaultConfig.Token = uuid.Generate()
-	config.VaultConfig.Namespace = "nondefault"
-
-	if err := s1.Reload(config); err != nil {
-		t.Fatalf("Reload failed: %v", err)
-	}
-
-	if !s1.vault.Running() {
-		t.Fatalf("Vault client should be running")
-	}
-
-	if s1.vault.GetConfig().Namespace != "nondefault" {
-		t.Fatalf("Vault client did not get new namespace")
-	}
 }
 
 func connectionReset(msg string) bool {

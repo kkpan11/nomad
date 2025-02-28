@@ -1,6 +1,6 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 import { action } from '@ember/object';
@@ -10,8 +10,6 @@ import Modifier from 'ember-modifier';
 
 import 'codemirror/addon/edit/matchbrackets';
 import 'codemirror/addon/selection/active-line';
-import 'codemirror/addon/lint/lint.js';
-import 'codemirror/addon/lint/json-lint.js';
 import 'codemirror/mode/javascript/javascript';
 import 'codemirror/mode/ruby/ruby';
 
@@ -25,11 +23,21 @@ export default class CodeMirrorModifier extends Modifier {
     }
   }
 
-  didInstall() {
-    this._setup();
+  element = null;
+  args = {};
+
+  modify(element, positional, named) {
+    if (!this.element) {
+      this.element = element;
+      this.args = { positional, named };
+      this._setup();
+    } else {
+      this.didUpdateArguments();
+    }
   }
 
   didUpdateArguments() {
+    this._editor.setOption('lineWrapping', this.args.named.lineWrapping);
     this._editor.setOption('readOnly', this.args.named.readOnly);
     if (!this.args.named.content) {
       return;
@@ -51,9 +59,8 @@ export default class CodeMirrorModifier extends Modifier {
   _setup() {
     if (this.element) {
       const editor = codemirror(this.element, {
-        gutters: this.args.named.gutters || ['CodeMirror-lint-markers'],
+        gutters: this.args.named.gutters || [],
         matchBrackets: true,
-        lint: { lintOnChange: true },
         showCursorWhenSelecting: true,
         styleActiveLine: true,
         tabSize: 2,
@@ -66,6 +73,7 @@ export default class CodeMirrorModifier extends Modifier {
         value: this.args.named.content || '',
         viewportMargin: this.args.named.viewportMargin || '',
         screenReaderLabel: this.args.named.screenReaderLabel || '',
+        lineWrapping: this.args.named.lineWrapping || false,
       });
 
       if (this.autofocus) {

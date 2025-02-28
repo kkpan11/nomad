@@ -1,6 +1,6 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 import Controller from '@ember/controller';
@@ -25,15 +25,13 @@ export default class VolumeController extends Controller {
 
   get breadcrumbs() {
     const volume = this.volume;
+    if (!volume) {
+      return [];
+    }
     return [
       {
         label: 'Volumes',
-        args: [
-          'csi.volumes',
-          qpBuilder({
-            volumeNamespace: volume.get('namespace.name') || 'default',
-          }),
-        ],
+        args: ['csi.volumes'],
       },
       {
         label: volume.name,
@@ -60,6 +58,6 @@ export default class VolumeController extends Controller {
 
   @action
   gotoAllocation(allocation) {
-    this.transitionToRoute('allocations.allocation', allocation);
+    this.transitionToRoute('allocations.allocation', allocation.id);
   }
 }

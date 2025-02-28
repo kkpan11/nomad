@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package flags
 
@@ -94,6 +94,10 @@ func (u *UintValue) Set(v string) error {
 	}
 
 	parsed, err := strconv.ParseUint(v, 0, bits.UintSize)
+	if err != nil {
+		return err
+	}
+
 	*(u.v) = (uint)(parsed)
 	return err
 }

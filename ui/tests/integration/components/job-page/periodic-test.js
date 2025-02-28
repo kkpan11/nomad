@@ -1,6 +1,6 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 import { module, test } from 'qunit';
@@ -39,6 +39,8 @@ module('Integration | Component | job-page/periodic', function (hooks) {
     this.store = this.owner.lookup('service:store');
     this.server = startMirage();
     this.server.create('namespace');
+    this.server.create('node-pool');
+    this.server.create('node');
   });
 
   hooks.afterEach(function () {
@@ -52,6 +54,7 @@ module('Integration | Component | job-page/periodic', function (hooks) {
       @sortProperty={{sortProperty}}
       @sortDescending={{sortDescending}}
       @currentPage={{currentPage}}
+      @childJobs={{job.children}}
     />
   `;
 
@@ -174,7 +177,7 @@ module('Integration | Component | job-page/periodic', function (hooks) {
     this.server.pretender.delete('/v1/job/:id', () => [403, {}, '']);
 
     const mirageJob = this.server.create('job', 'periodic', {
-      childrenCount: 0,
+      childrenCount: 2,
       createAllocations: false,
       status: 'running',
     });
@@ -193,12 +196,14 @@ module('Integration | Component | job-page/periodic', function (hooks) {
   });
 
   test('Starting a job sends a post request for the job using the current definition', async function (assert) {
-    assert.expect(2);
+    assert.expect(1);
 
     const mirageJob = this.server.create('job', 'periodic', {
       childrenCount: 0,
       createAllocations: false,
       status: 'dead',
+      withPreviousStableVersion: true,
+      stopped: true,
     });
     await this.store.findAll('job');
 
@@ -220,6 +225,8 @@ module('Integration | Component | job-page/periodic', function (hooks) {
       childrenCount: 0,
       createAllocations: false,
       status: 'dead',
+      withPreviousStableVersion: true,
+      stopped: true,
     });
     await this.store.findAll('job');
 
@@ -240,6 +247,8 @@ module('Integration | Component | job-page/periodic', function (hooks) {
       childrenCount: 0,
       createAllocations: false,
       status: 'dead',
+      withPreviousStableVersion: true,
+      stopped: true,
     });
     await this.store.findAll('job');
 

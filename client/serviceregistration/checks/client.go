@@ -1,11 +1,12 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package checks
 
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
@@ -155,11 +156,18 @@ func (c *checker) checkHTTP(ctx context.Context, qc *QueryContext, q *Query) *st
 		return qr
 	}
 
-	u := (&url.URL{
+	relative, err := url.Parse(q.Path)
+	if err != nil {
+		qr.Output = err.Error()
+		qr.Status = structs.CheckFailure
+		return qr
+	}
+
+	base := url.URL{
 		Scheme: q.Protocol,
 		Host:   addr,
-		Path:   q.Path,
-	}).String()
+	}
+	u := base.ResolveReference(relative).String()
 
 	request, err := http.NewRequest(q.Method, u, nil)
 	if err != nil {
@@ -182,6 +190,16 @@ func (c *checker) checkHTTP(ctx context.Context, qc *QueryContext, q *Query) *st
 	request.Body = io.NopCloser(strings.NewReader(q.Body))
 	request = request.WithContext(ctx)
 
+	// Leave this setup until the last as it doesn't generate an error. If the
+	// check has specified TLS skip verify, generate a new round tripper. This
+	// job specification "check.tls_skip_verify" parameter supports in-place
+	// updates, so we must do this on each check iteration.
+	if q.TLSSkipVerify {
+		trans := cleanhttp.DefaultPooledTransport()
+		trans.TLSClientConfig = &tls.Config{InsecureSkipVerify: q.TLSSkipVerify}
+		c.httpClient.Transport = trans
+	}
+
 	result, err := c.httpClient.Do(request)
 	if err != nil {
 		qr.Output = fmt.Sprintf("nomad: %s", err.Error())
@@ -196,11 +214,14 @@ func (c *checker) checkHTTP(ctx context.Context, qc *QueryContext, q *Query) *st
 	qr.StatusCode = result.StatusCode
 
 	switch {
-	case result.StatusCode == 200:
+	case result.StatusCode == http.StatusOK:
 		qr.Status = structs.CheckSuccess
+		// The check output is ignored on success to prevent users from relying
+		// on their content since querying service check results is an
+		// expensive operation.
 		qr.Output = "nomad: http ok"
 		return qr
-	case result.StatusCode < 400:
+	case result.StatusCode < http.StatusBadRequest:
 		qr.Status = structs.CheckSuccess
 	default:
 		qr.Status = structs.CheckFailure

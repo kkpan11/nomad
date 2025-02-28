@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package agent
 
@@ -20,22 +20,12 @@ func (s *HTTPServer) CSIVolumesRequest(resp http.ResponseWriter, req *http.Reque
 		return nil, CodedError(405, ErrInvalidMethod)
 	}
 
-	// Type filters volume lists to a specific type. When support for non-CSI volumes is
-	// introduced, we'll need to dispatch here
-	query := req.URL.Query()
-	qtype, ok := query["type"]
-	if !ok {
-		return []*structs.CSIVolListStub{}, nil
-	}
-	if qtype[0] != "csi" {
-		return nil, nil
-	}
-
 	args := structs.CSIVolumeListRequest{}
 	if s.parse(resp, req, &args.Region, &args.QueryOptions) {
 		return nil, nil
 	}
 
+	query := req.URL.Query()
 	args.Prefix = query.Get("prefix")
 	args.PluginID = query.Get("plugin_id")
 	args.NodeID = query.Get("node_id")

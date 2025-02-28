@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package allocrunner
 
@@ -7,13 +7,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/hashicorp/nomad/ci"
 	"github.com/hashicorp/nomad/client/allocrunner/interfaces"
-	"github.com/hashicorp/nomad/client/pluginmanager"
+	"github.com/hashicorp/nomad/client/allocrunner/state"
 	"github.com/hashicorp/nomad/client/pluginmanager/csimanager"
 	cstructs "github.com/hashicorp/nomad/client/structs"
 	"github.com/hashicorp/nomad/helper/pointer"
@@ -21,7 +20,8 @@ import (
 	"github.com/hashicorp/nomad/nomad/mock"
 	"github.com/hashicorp/nomad/nomad/structs"
 	"github.com/hashicorp/nomad/plugins/drivers"
-	"github.com/stretchr/testify/require"
+	"github.com/hashicorp/nomad/testutil"
+	"github.com/shoenig/test/must"
 )
 
 var _ interfaces.RunnerPrerunHook = (*csiHook)(nil)
@@ -31,28 +31,41 @@ func TestCSIHook(t *testing.T) {
 	ci.Parallel(t)
 
 	alloc := mock.Alloc()
-	logger := testlog.HCLogger(t)
+
+	volID := "volID0"
+	volName := "volName"
+	pluginID := "plugin_id"
+
+	// expected by most of the tests
+	testMountSrc := fmt.Sprintf(
+		"test-alloc-dir/%s/ns/%s/ro-file-system-single-node-reader-only", alloc.ID, volID)
 
 	testcases := []struct {
-		name                   string
-		volumeRequests         map[string]*structs.VolumeRequest
-		startsUnschedulable    bool
-		startsWithClaims       bool
-		expectedClaimErr       error
-		expectedMounts         map[string]*csimanager.MountInfo
-		expectedMountCalls     int
-		expectedUnmountCalls   int
-		expectedClaimCalls     int
-		expectedUnpublishCalls int
+		name           string
+		volumeRequests map[string]*structs.VolumeRequest
+		rpcNS          string // namespace of volume, as returned by server in Claim
+
+		startsUnschedulable   bool                 // claim will fail
+		startsWithClaims      bool                 // claim exists on server
+		startsWithStubs       bool                 // mount info is written to client state
+		startsWithValidMounts bool                 // mounts were created
+		startingStub          *state.CSIVolumeStub // mount info used in starting mounts/stubs
+		startingVolumeNS      string               // namespace of volume previously mounted
+
+		failsFirstUnmount bool
+		expectedClaimErr  error
+		expectedMounts    map[string]*csimanager.MountInfo
+		expectedCalls     map[string]int
 	}{
 
 		{
-			name: "simple case",
+			name:  "simple case",
+			rpcNS: "ns",
 			volumeRequests: map[string]*structs.VolumeRequest{
-				"vol0": {
-					Name:           "vol0",
+				volName: {
+					Name:           volName,
 					Type:           structs.VolumeTypeCSI,
-					Source:         "testvolume0",
+					Source:         volID,
 					ReadOnly:       true,
 					AccessMode:     structs.CSIVolumeAccessModeSingleNodeReader,
 					AttachmentMode: structs.CSIVolumeAttachmentModeFilesystem,
@@ -61,22 +74,20 @@ func TestCSIHook(t *testing.T) {
 				},
 			},
 			expectedMounts: map[string]*csimanager.MountInfo{
-				"vol0": &csimanager.MountInfo{Source: fmt.Sprintf(
-					"test-alloc-dir/%s/testvolume0/ro-file-system-single-node-reader-only", alloc.ID)},
+				volName: &csimanager.MountInfo{Source: testMountSrc},
 			},
-			expectedMountCalls:     1,
-			expectedUnmountCalls:   1,
-			expectedClaimCalls:     1,
-			expectedUnpublishCalls: 1,
+			expectedCalls: map[string]int{
+				"claim": 1, "MountVolume": 1, "UnmountVolume": 1, "unpublish": 1},
 		},
 
 		{
-			name: "per-alloc case",
+			name:  "per-alloc case",
+			rpcNS: "ns",
 			volumeRequests: map[string]*structs.VolumeRequest{
-				"vol0": {
-					Name:           "vol0",
+				volName: {
+					Name:           volName,
 					Type:           structs.VolumeTypeCSI,
-					Source:         "testvolume0",
+					Source:         volID,
 					ReadOnly:       true,
 					AccessMode:     structs.CSIVolumeAccessModeSingleNodeReader,
 					AttachmentMode: structs.CSIVolumeAttachmentModeFilesystem,
@@ -85,22 +96,20 @@ func TestCSIHook(t *testing.T) {
 				},
 			},
 			expectedMounts: map[string]*csimanager.MountInfo{
-				"vol0": &csimanager.MountInfo{Source: fmt.Sprintf(
-					"test-alloc-dir/%s/testvolume0/ro-file-system-single-node-reader-only", alloc.ID)},
+				volName: &csimanager.MountInfo{Source: testMountSrc},
 			},
-			expectedMountCalls:     1,
-			expectedUnmountCalls:   1,
-			expectedClaimCalls:     1,
-			expectedUnpublishCalls: 1,
+			expectedCalls: map[string]int{
+				"claim": 1, "MountVolume": 1, "UnmountVolume": 1, "unpublish": 1},
 		},
 
 		{
-			name: "fatal error on claim",
+			name:  "fatal error on claim",
+			rpcNS: "ns",
 			volumeRequests: map[string]*structs.VolumeRequest{
-				"vol0": {
-					Name:           "vol0",
+				volName: {
+					Name:           volName,
 					Type:           structs.VolumeTypeCSI,
-					Source:         "testvolume0",
+					Source:         volID,
 					ReadOnly:       true,
 					AccessMode:     structs.CSIVolumeAccessModeSingleNodeReader,
 					AttachmentMode: structs.CSIVolumeAttachmentModeFilesystem,
@@ -109,25 +118,19 @@ func TestCSIHook(t *testing.T) {
 				},
 			},
 			startsUnschedulable: true,
-			expectedMounts: map[string]*csimanager.MountInfo{
-				"vol0": &csimanager.MountInfo{Source: fmt.Sprintf(
-					"test-alloc-dir/%s/testvolume0/ro-file-system-single-node-reader-only", alloc.ID)},
-			},
-			expectedMountCalls:     0,
-			expectedUnmountCalls:   0,
-			expectedClaimCalls:     1,
-			expectedUnpublishCalls: 0,
+			expectedCalls:       map[string]int{"claim": 1, "UnmountVolume": 1, "unpublish": 1},
 			expectedClaimErr: errors.New(
-				"claim volumes: could not claim volume testvolume0: volume is currently unschedulable"),
+				"claiming volumes: could not claim volume volID0: volume is currently unschedulable"),
 		},
 
 		{
-			name: "retryable error on claim",
+			name:  "retryable error on claim",
+			rpcNS: "ns",
 			volumeRequests: map[string]*structs.VolumeRequest{
-				"vol0": {
-					Name:           "vol0",
+				volName: {
+					Name:           volName,
 					Type:           structs.VolumeTypeCSI,
-					Source:         "testvolume0",
+					Source:         volID,
 					ReadOnly:       true,
 					AccessMode:     structs.CSIVolumeAccessModeSingleNodeReader,
 					AttachmentMode: structs.CSIVolumeAttachmentModeFilesystem,
@@ -137,64 +140,186 @@ func TestCSIHook(t *testing.T) {
 			},
 			startsWithClaims: true,
 			expectedMounts: map[string]*csimanager.MountInfo{
-				"vol0": &csimanager.MountInfo{Source: fmt.Sprintf(
-					"test-alloc-dir/%s/testvolume0/ro-file-system-single-node-reader-only", alloc.ID)},
+				volName: &csimanager.MountInfo{Source: testMountSrc},
 			},
-			expectedMountCalls:     1,
-			expectedUnmountCalls:   1,
-			expectedClaimCalls:     2,
-			expectedUnpublishCalls: 1,
+			expectedCalls: map[string]int{
+				"claim": 2, "MountVolume": 1, "UnmountVolume": 1, "unpublish": 1},
 		},
 
-		// TODO: this won't actually work on the client.
-		// https://github.com/hashicorp/nomad/issues/11798
-		//
-		// {
-		// 	name: "one source volume mounted read-only twice",
-		// 	volumeRequests: map[string]*structs.VolumeRequest{
-		// 		"vol0": {
-		// 			Name:           "vol0",
-		// 			Type:           structs.VolumeTypeCSI,
-		// 			Source:         "testvolume0",
-		// 			ReadOnly:       true,
-		// 			AccessMode:     structs.CSIVolumeAccessModeMultiNodeReader,
-		// 			AttachmentMode: structs.CSIVolumeAttachmentModeFilesystem,
-		// 			MountOptions:   &structs.CSIMountOptions{},
-		// 			PerAlloc:       false,
-		// 		},
-		// 		"vol1": {
-		// 			Name:           "vol1",
-		// 			Type:           structs.VolumeTypeCSI,
-		// 			Source:         "testvolume0",
-		// 			ReadOnly:       false,
-		// 			AccessMode:     structs.CSIVolumeAccessModeMultiNodeReader,
-		// 			AttachmentMode: structs.CSIVolumeAttachmentModeFilesystem,
-		// 			MountOptions:   &structs.CSIMountOptions{},
-		// 			PerAlloc:       false,
-		// 		},
-		// 	},
-		// 	expectedMounts: map[string]*csimanager.MountInfo{
-		// 		"vol0": &csimanager.MountInfo{Source: fmt.Sprintf(
-		// 			"test-alloc-dir/%s/testvolume0/ro-file-system-multi-node-reader-only", alloc.ID)},
-		// 		"vol1": &csimanager.MountInfo{Source: fmt.Sprintf(
-		// 			"test-alloc-dir/%s/testvolume0/ro-file-system-multi-node-reader-only", alloc.ID)},
-		// 	},
-		// 	expectedMountCalls:     1,
-		// 	expectedUnmountCalls:   1,
-		// 	expectedClaimCalls:     1,
-		// 	expectedUnpublishCalls: 1,
-		// },
+		{
+			name:  "already mounted",
+			rpcNS: "ns",
+			volumeRequests: map[string]*structs.VolumeRequest{
+				volName: {
+					Name:           volName,
+					Type:           structs.VolumeTypeCSI,
+					Source:         volID,
+					ReadOnly:       true,
+					AccessMode:     structs.CSIVolumeAccessModeSingleNodeReader,
+					AttachmentMode: structs.CSIVolumeAttachmentModeFilesystem,
+					MountOptions:   &structs.CSIMountOptions{},
+					PerAlloc:       false,
+				},
+			},
+			startsWithStubs:       true,
+			startsWithValidMounts: true,
+			startingVolumeNS:      "ns",
+			startingStub: &state.CSIVolumeStub{
+				VolumeID:        volID,
+				VolumeNamespace: "ns",
+				PluginID:        pluginID,
+				ExternalNodeID:  "i-example",
+				MountInfo:       &csimanager.MountInfo{Source: testMountSrc},
+			},
+			expectedMounts: map[string]*csimanager.MountInfo{
+				volName: &csimanager.MountInfo{Source: testMountSrc},
+			},
+			expectedCalls: map[string]int{"HasMount": 1, "UnmountVolume": 1, "unpublish": 1},
+		},
+
+		{
+			name:  "existing but invalid mounts",
+			rpcNS: "ns",
+			volumeRequests: map[string]*structs.VolumeRequest{
+				volName: {
+					Name:           volName,
+					Type:           structs.VolumeTypeCSI,
+					Source:         volID,
+					ReadOnly:       true,
+					AccessMode:     structs.CSIVolumeAccessModeSingleNodeReader,
+					AttachmentMode: structs.CSIVolumeAttachmentModeFilesystem,
+					MountOptions:   &structs.CSIMountOptions{},
+					PerAlloc:       false,
+				},
+			},
+			// same as case above, but the stub only exists in the client state
+			// db and not actually on-disk (ex. after host reboot)
+			startsWithStubs:       true,
+			startsWithValidMounts: false,
+			startingVolumeNS:      "ns",
+			startingStub: &state.CSIVolumeStub{
+				VolumeID:        volID,
+				VolumeNamespace: "ns",
+				PluginID:        pluginID,
+				ExternalNodeID:  "i-example",
+				MountInfo:       &csimanager.MountInfo{Source: testMountSrc},
+			},
+			expectedMounts: map[string]*csimanager.MountInfo{
+				volName: &csimanager.MountInfo{Source: testMountSrc},
+			},
+			expectedCalls: map[string]int{
+				"HasMount": 1, "claim": 1, "MountVolume": 1, "UnmountVolume": 1, "unpublish": 1},
+		},
+
+		{
+			name:  "retry on failed unmount",
+			rpcNS: "ns",
+			volumeRequests: map[string]*structs.VolumeRequest{
+				volName: {
+					Name:           volName,
+					Type:           structs.VolumeTypeCSI,
+					Source:         volID,
+					ReadOnly:       true,
+					AccessMode:     structs.CSIVolumeAccessModeSingleNodeReader,
+					AttachmentMode: structs.CSIVolumeAttachmentModeFilesystem,
+					MountOptions:   &structs.CSIMountOptions{},
+					PerAlloc:       false,
+				},
+			},
+			failsFirstUnmount: true,
+			expectedMounts: map[string]*csimanager.MountInfo{
+				volName: &csimanager.MountInfo{Source: testMountSrc},
+			},
+			expectedCalls: map[string]int{
+				"claim": 1, "MountVolume": 1, "UnmountVolume": 2, "unpublish": 2},
+		},
+
+		{
+			name:  "client upgrade from version with missing namespace",
+			rpcNS: "",
+			volumeRequests: map[string]*structs.VolumeRequest{
+				volName: {
+					Name:           volName,
+					Type:           structs.VolumeTypeCSI,
+					Source:         volID,
+					ReadOnly:       true,
+					AccessMode:     structs.CSIVolumeAccessModeSingleNodeReader,
+					AttachmentMode: structs.CSIVolumeAttachmentModeFilesystem,
+					MountOptions:   &structs.CSIMountOptions{},
+					PerAlloc:       false,
+				},
+			},
+			startsWithStubs:       true,
+			startsWithValidMounts: true,
+			startingVolumeNS:      "", // note: existing mount has no namespace
+			startingStub: &state.CSIVolumeStub{
+				VolumeID:        volID,
+				VolumeNamespace: "",
+				PluginID:        pluginID,
+				ExternalNodeID:  "i-example",
+				MountInfo: &csimanager.MountInfo{Source: fmt.Sprintf(
+					"test-alloc-dir/%s/volID0/ro-file-system-single-node-reader-only", alloc.ID)},
+			},
+			expectedMounts: map[string]*csimanager.MountInfo{
+				volName: &csimanager.MountInfo{Source: fmt.Sprintf(
+					"test-alloc-dir/%s/volID0/ro-file-system-single-node-reader-only", alloc.ID)},
+			},
+			expectedCalls: map[string]int{"HasMount": 1, "UnmountVolume": 1, "unpublish": 1},
+		},
+
+		{
+			name:  "server upgrade from version with missing namespace",
+			rpcNS: "ns",
+			volumeRequests: map[string]*structs.VolumeRequest{
+				volName: {
+					Name:           volName,
+					Type:           structs.VolumeTypeCSI,
+					Source:         volID,
+					ReadOnly:       true,
+					AccessMode:     structs.CSIVolumeAccessModeSingleNodeReader,
+					AttachmentMode: structs.CSIVolumeAttachmentModeFilesystem,
+					MountOptions:   &structs.CSIMountOptions{},
+					PerAlloc:       false,
+				},
+			},
+			startsWithStubs:       true,
+			startsWithValidMounts: true,
+			startingVolumeNS:      "", // note: existing mount has no namespace
+			startingStub: &state.CSIVolumeStub{
+				VolumeID:        volName,
+				VolumeNamespace: "",
+				PluginID:        pluginID,
+				ExternalNodeID:  "i-example",
+				MountInfo: &csimanager.MountInfo{Source: fmt.Sprintf(
+					"test-alloc-dir/%s/volID0/ro-file-system-single-node-reader-only", alloc.ID)},
+			},
+			expectedMounts: map[string]*csimanager.MountInfo{
+				volName: &csimanager.MountInfo{Source: fmt.Sprintf(
+					"test-alloc-dir/%s/volID0/ro-file-system-single-node-reader-only", alloc.ID)},
+			},
+			expectedCalls: map[string]int{"HasMount": 1, "UnmountVolume": 1, "unpublish": 1},
+		},
+
+		{
+			name:           "should not run",
+			volumeRequests: map[string]*structs.VolumeRequest{},
+		},
 	}
 
 	for i := range testcases {
 		tc := testcases[i]
 		t.Run(tc.name, func(t *testing.T) {
+
 			alloc.Job.TaskGroups[0].Volumes = tc.volumeRequests
 
-			callCounts := map[string]int{}
-			mgr := mockPluginManager{mounter: mockVolumeMounter{callCounts: callCounts}}
+			callCounts := testutil.NewCallCounter()
+			vm := &csimanager.MockVolumeManager{
+				CallCounter: callCounts,
+			}
+			mgr := &csimanager.MockCSIManager{VM: vm}
 			rpcer := mockRPCer{
 				alloc:            alloc,
+				ns:               tc.rpcNS,
 				callCounts:       callCounts,
 				hasExistingClaim: pointer.Of(tc.startsWithClaims),
 				schedulable:      pointer.Of(!tc.startsUnschedulable),
@@ -205,48 +330,87 @@ func TestCSIHook(t *testing.T) {
 					FSIsolation:  drivers.FSIsolationChroot,
 					MountConfigs: drivers.MountConfigSupportAll,
 				},
+				stubs: make(map[string]*state.CSIVolumeStub),
 			}
+
+			logger := testlog.HCLogger(t)
 			hook := newCSIHook(alloc, logger, mgr, rpcer, ar, ar.res, "secret")
 			hook.minBackoffInterval = 1 * time.Millisecond
 			hook.maxBackoffInterval = 10 * time.Millisecond
 			hook.maxBackoffDuration = 500 * time.Millisecond
 
-			require.NotNil(t, hook)
+			must.NotNil(t, hook)
 
-			if tc.expectedClaimErr != nil {
-				require.EqualError(t, hook.Prerun(), tc.expectedClaimErr.Error())
-				mounts := ar.res.GetCSIMounts()
-				require.Nil(t, mounts)
-			} else {
-				require.NoError(t, hook.Prerun())
-				mounts := ar.res.GetCSIMounts()
-				require.NotNil(t, mounts)
-				require.Equal(t, tc.expectedMounts, mounts)
-				require.NoError(t, hook.Postrun())
+			if tc.startsWithStubs {
+				// write a fake mount stub to the "client state"
+				ar.stubs[volName] = tc.startingStub
+				ar.SetCSIVolumes(map[string]*state.CSIVolumeStub{volName: tc.startingStub})
 			}
 
-			require.Equal(t, tc.expectedMountCalls, callCounts["mount"])
-			require.Equal(t, tc.expectedUnmountCalls, callCounts["unmount"])
-			require.Equal(t, tc.expectedClaimCalls, callCounts["claim"])
-			require.Equal(t, tc.expectedUnpublishCalls, callCounts["unpublish"])
+			if tc.startsWithValidMounts {
+				// create a fake mount
+				req := tc.volumeRequests[volName]
+				vol := rpcer.testVolume(req.Source, tc.startingVolumeNS)
+				_, err := vm.MountVolume(context.TODO(), vol, alloc,
+					&csimanager.UsageOptions{
+						ReadOnly:       req.ReadOnly,
+						AttachmentMode: req.AttachmentMode,
+						AccessMode:     req.AccessMode,
+					}, nil)
+				must.NoError(t, err)
+				vm.CallCounter.Reset()
+			}
+
+			if tc.failsFirstUnmount {
+				vm.NextUnmountVolumeErr = errors.New("bad first attempt")
+			}
+
+			err := hook.Prerun()
+			if tc.expectedClaimErr != nil {
+				must.EqError(t, err, tc.expectedClaimErr.Error())
+			} else {
+				must.NoError(t, err)
+			}
+
+			mounts := ar.res.GetCSIMounts()
+			must.MapEq(t, tc.expectedMounts, mounts,
+				must.Sprintf("got mounts: %v", mounts))
+
+			// even if we failed to mount in the first place, we should get no
+			// errors from Postrun
+			must.NoError(t, hook.Postrun())
+
+			if tc.failsFirstUnmount {
+				// retrying the unmount doesn't block Postrun, so give it time
+				// to run once more before checking the call counts to ensure
+				// this doesn't flake between 1 and 2 unmount/unpublish calls
+				time.Sleep(100 * time.Millisecond)
+			}
+
+			counts := callCounts.Get()
+			must.MapEq(t, tc.expectedCalls, counts,
+				must.Sprintf("got calls: %v\n\texpected: %v", counts, tc.expectedCalls))
 
 		})
 	}
 
 }
 
-// TestCSIHook_claimVolumesFromAlloc_Validation tests that the validation of task
-// capabilities in claimVolumesFromAlloc ensures at least one task supports CSI.
-func TestCSIHook_claimVolumesFromAlloc_Validation(t *testing.T) {
+// TestCSIHook_Prerun_Validation tests that the validation of task capabilities
+// in Prerun ensures at least one task supports CSI.
+func TestCSIHook_Prerun_Validation(t *testing.T) {
 	ci.Parallel(t)
+
+	volID := "volID0"
+	volName := "volName"
 
 	alloc := mock.Alloc()
 	logger := testlog.HCLogger(t)
 	volumeRequests := map[string]*structs.VolumeRequest{
-		"vol0": {
-			Name:           "vol0",
+		volName: {
+			Name:           volName,
 			Type:           structs.VolumeTypeCSI,
-			Source:         "testvolume0",
+			Source:         volID,
 			ReadOnly:       true,
 			AccessMode:     structs.CSIVolumeAccessModeSingleNodeReader,
 			AttachmentMode: structs.CSIVolumeAttachmentModeFilesystem,
@@ -256,10 +420,10 @@ func TestCSIHook_claimVolumesFromAlloc_Validation(t *testing.T) {
 	}
 
 	type testCase struct {
-		name             string
-		caps             *drivers.Capabilities
-		capFunc          func() (*drivers.Capabilities, error)
-		expectedClaimErr error
+		name        string
+		caps        *drivers.Capabilities
+		capFunc     func() (*drivers.Capabilities, error)
+		expectedErr string
 	}
 
 	testcases := []testCase{
@@ -268,8 +432,8 @@ func TestCSIHook_claimVolumesFromAlloc_Validation(t *testing.T) {
 			caps: &drivers.Capabilities{
 				MountConfigs: drivers.MountConfigSupportNone,
 			},
-			capFunc:          nil,
-			expectedClaimErr: errors.New("claim volumes: no task supports CSI"),
+			capFunc:     nil,
+			expectedErr: "no task supports CSI",
 		},
 
 		{
@@ -278,7 +442,7 @@ func TestCSIHook_claimVolumesFromAlloc_Validation(t *testing.T) {
 			capFunc: func() (*drivers.Capabilities, error) {
 				return nil, errors.New("error thrown by driver")
 			},
-			expectedClaimErr: errors.New("claim volumes: could not validate task driver capabilities: error thrown by driver"),
+			expectedErr: "could not validate task driver capabilities: error thrown by driver",
 		},
 
 		{
@@ -286,8 +450,7 @@ func TestCSIHook_claimVolumesFromAlloc_Validation(t *testing.T) {
 			caps: &drivers.Capabilities{
 				MountConfigs: drivers.MountConfigSupportAll,
 			},
-			capFunc:          nil,
-			expectedClaimErr: nil,
+			capFunc: nil,
 		},
 	}
 
@@ -295,12 +458,12 @@ func TestCSIHook_claimVolumesFromAlloc_Validation(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			alloc.Job.TaskGroups[0].Volumes = volumeRequests
 
-			callCounts := map[string]int{}
-			mgr := mockPluginManager{mounter: mockVolumeMounter{callCounts: callCounts}}
-
+			mgr := &csimanager.MockCSIManager{
+				VM: &csimanager.MockVolumeManager{},
+			}
 			rpcer := mockRPCer{
 				alloc:            alloc,
-				callCounts:       callCounts,
+				callCounts:       testutil.NewCallCounter(),
 				hasExistingClaim: pointer.Of(false),
 				schedulable:      pointer.Of(true),
 			}
@@ -312,17 +475,17 @@ func TestCSIHook_claimVolumesFromAlloc_Validation(t *testing.T) {
 			}
 
 			hook := newCSIHook(alloc, logger, mgr, rpcer, ar, ar.res, "secret")
-			require.NotNil(t, hook)
+			must.NotNil(t, hook)
 
-			if tc.expectedClaimErr != nil {
-				require.EqualError(t, hook.Prerun(), tc.expectedClaimErr.Error())
+			if tc.expectedErr != "" {
+				must.EqError(t, hook.Prerun(), tc.expectedErr)
 				mounts := ar.res.GetCSIMounts()
-				require.Nil(t, mounts)
+				must.Nil(t, mounts)
 			} else {
-				require.NoError(t, hook.Prerun())
+				must.NoError(t, hook.Prerun())
 				mounts := ar.res.GetCSIMounts()
-				require.NotNil(t, mounts)
-				require.NoError(t, hook.Postrun())
+				must.NotNil(t, mounts)
+				must.NoError(t, hook.Postrun())
 			}
 		})
 	}
@@ -332,19 +495,26 @@ func TestCSIHook_claimVolumesFromAlloc_Validation(t *testing.T) {
 
 type mockRPCer struct {
 	alloc            *structs.Allocation
-	callCounts       map[string]int
+	ns               string
+	callCounts       *testutil.CallCounter
 	hasExistingClaim *bool
 	schedulable      *bool
 }
 
 // RPC mocks the server RPCs, acting as though any request succeeds
-func (r mockRPCer) RPC(method string, args interface{}, reply interface{}) error {
+func (r mockRPCer) RPC(method string, args any, reply any) error {
 	switch method {
 	case "CSIVolume.Claim":
-		r.callCounts["claim"]++
+		r.callCounts.Inc("claim")
 		req := args.(*structs.CSIVolumeClaimRequest)
-		vol := r.testVolume(req.VolumeID)
+		vol := r.testVolume(req.VolumeID, r.ns)
 		err := vol.Claim(req.ToClaim(), r.alloc)
+
+		// after the first claim attempt is made, reset the volume's claims as
+		// though it's been released from another node
+		*r.hasExistingClaim = false
+		*r.schedulable = true
+
 		if err != nil {
 			return err
 		}
@@ -353,22 +523,25 @@ func (r mockRPCer) RPC(method string, args interface{}, reply interface{}) error
 		resp.PublishContext = map[string]string{}
 		resp.Volume = vol
 		resp.QueryMeta = structs.QueryMeta{}
+
 	case "CSIVolume.Unpublish":
-		r.callCounts["unpublish"]++
+		r.callCounts.Inc("unpublish")
 		resp := reply.(*structs.CSIVolumeUnpublishResponse)
 		resp.QueryMeta = structs.QueryMeta{}
+
 	default:
 		return fmt.Errorf("unexpected method")
 	}
 	return nil
 }
 
-// testVolume is a helper that optionally starts as unschedulable /
-// claimed until after the first claim RPC is made, so that we can
-// test retryable vs non-retryable failures
-func (r mockRPCer) testVolume(id string) *structs.CSIVolume {
+// testVolume is a helper that optionally starts as unschedulable / claimed, so
+// that we can test retryable vs non-retryable failures
+func (r mockRPCer) testVolume(id, ns string) *structs.CSIVolume {
 	vol := structs.NewCSIVolume(id, 0)
 	vol.Schedulable = *r.schedulable
+	vol.PluginID = "plugin-" + id
+	vol.Namespace = ns
 	vol.RequestedCapabilities = []*structs.CSIVolumeCapability{
 		{
 			AttachmentMode: structs.CSIVolumeAttachmentModeFilesystem,
@@ -393,49 +566,16 @@ func (r mockRPCer) testVolume(id string) *structs.CSIVolume {
 		}
 	}
 
-	if r.callCounts["claim"] >= 0 {
-		*r.hasExistingClaim = false
-		*r.schedulable = true
-	}
-
 	return vol
 }
-
-type mockVolumeMounter struct {
-	callCounts map[string]int
-}
-
-func (vm mockVolumeMounter) MountVolume(ctx context.Context, vol *structs.CSIVolume, alloc *structs.Allocation, usageOpts *csimanager.UsageOptions, publishContext map[string]string) (*csimanager.MountInfo, error) {
-	vm.callCounts["mount"]++
-	return &csimanager.MountInfo{
-		Source: filepath.Join("test-alloc-dir", alloc.ID, vol.ID, usageOpts.ToFS()),
-	}, nil
-}
-func (vm mockVolumeMounter) UnmountVolume(ctx context.Context, volID, remoteID, allocID string, usageOpts *csimanager.UsageOptions) error {
-	vm.callCounts["unmount"]++
-	return nil
-}
-
-type mockPluginManager struct {
-	mounter mockVolumeMounter
-}
-
-func (mgr mockPluginManager) WaitForPlugin(ctx context.Context, pluginType, pluginID string) error {
-	return nil
-}
-
-func (mgr mockPluginManager) MounterForPlugin(ctx context.Context, pluginID string) (csimanager.VolumeMounter, error) {
-	return mgr.mounter, nil
-}
-
-// no-op methods to fulfill the interface
-func (mgr mockPluginManager) PluginManager() pluginmanager.PluginManager { return nil }
-func (mgr mockPluginManager) Shutdown()                                  {}
 
 type mockAllocRunner struct {
 	res     *cstructs.AllocHookResources
 	caps    *drivers.Capabilities
 	capFunc func() (*drivers.Capabilities, error)
+
+	stubs    map[string]*state.CSIVolumeStub
+	stubFunc func() (map[string]*state.CSIVolumeStub, error)
 }
 
 func (ar mockAllocRunner) GetTaskDriverCapabilities(taskName string) (*drivers.Capabilities, error) {
@@ -443,4 +583,16 @@ func (ar mockAllocRunner) GetTaskDriverCapabilities(taskName string) (*drivers.C
 		return ar.capFunc()
 	}
 	return ar.caps, nil
+}
+
+func (ar mockAllocRunner) SetCSIVolumes(stubs map[string]*state.CSIVolumeStub) error {
+	ar.stubs = stubs
+	return nil
+}
+
+func (ar mockAllocRunner) GetCSIVolumes() (map[string]*state.CSIVolumeStub, error) {
+	if ar.stubFunc != nil {
+		return ar.stubFunc()
+	}
+	return ar.stubs, nil
 }

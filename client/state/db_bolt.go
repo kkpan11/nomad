@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package state
 
@@ -17,6 +17,7 @@ import (
 	"github.com/hashicorp/nomad/client/dynamicplugins"
 	driverstate "github.com/hashicorp/nomad/client/pluginmanager/drivermanager/state"
 	"github.com/hashicorp/nomad/client/serviceregistration/checks"
+	cstructs "github.com/hashicorp/nomad/client/structs"
 	"github.com/hashicorp/nomad/helper/boltdd"
 	"github.com/hashicorp/nomad/nomad/structs"
 	"go.etcd.io/bbolt"
@@ -34,6 +35,8 @@ allocations/
 	 |--> deploy_status  -> deployStatusEntry{*structs.AllocDeploymentStatus}
 	 |--> network_status -> networkStatusEntry{*structs.AllocNetworkStatus}
 	 |--> acknowledged_state -> acknowledgedStateEntry{*arstate.State}
+	 |--> alloc_volumes -> allocVolumeStatesEntry{arstate.AllocVolumes}
+     |--> identities -> allocIdentitiesEntry{}
    |--> task-<name>/
       |--> local_state -> *trstate.LocalState # Local-only state
       |--> task_state  -> *structs.TaskState  # Syncs to servers
@@ -51,6 +54,9 @@ dynamicplugins/
 
 nodemeta/
 |--> meta -> map[string]*string
+
+node/
+|--> registration -> *cstructs.NodeRegistration
 */
 
 var (
@@ -88,6 +94,12 @@ var (
 	// acknowledgedStateKey is the key *arstate.State is stored under
 	acknowledgedStateKey = []byte("acknowledged_state")
 
+	allocVolumeKey = []byte("alloc_volume")
+
+	// allocIdentityKey is the key []*structs.SignedWorkloadIdentities is stored
+	// under
+	allocIdentityKey = []byte("alloc_identities")
+
 	// checkResultsBucket is the bucket name in which check query results are stored
 	checkResultsBucket = []byte("check_results")
 
@@ -120,6 +132,14 @@ var (
 
 	// nodeMetaKey is the key at which dynamic node metadata is stored.
 	nodeMetaKey = []byte("meta")
+
+	// nodeBucket is the bucket name in which data about the node is stored.
+	nodeBucket = []byte("node")
+
+	// nodeRegistrationKey is the key at which node registration data is stored.
+	nodeRegistrationKey = []byte("node_registration")
+
+	hostVolBucket = []byte("host_volumes_to_create")
 )
 
 // taskBucketName returns the bucket name for the given task name.
@@ -443,6 +463,111 @@ func (s *BoltStateDB) GetAcknowledgedState(allocID string) (*arstate.State, erro
 	}
 
 	return entry.State, nil
+}
+
+type allocVolumeStatesEntry struct {
+	State *arstate.AllocVolumes
+}
+
+// PutAllocVolumes stores stubs of an allocation's dynamic volume mounts so they
+// can be restored.
+func (s *BoltStateDB) PutAllocVolumes(allocID string, state *arstate.AllocVolumes, opts ...WriteOption) error {
+	return s.updateWithOptions(opts, func(tx *boltdd.Tx) error {
+		allocBkt, err := getAllocationBucket(tx, allocID)
+		if err != nil {
+			return err
+		}
+
+		entry := allocVolumeStatesEntry{
+			State: state,
+		}
+		return allocBkt.Put(allocVolumeKey, &entry)
+	})
+}
+
+// GetAllocVolumes retrieves stubs of an allocation's dynamic volume mounts so
+// they can be restored.
+func (s *BoltStateDB) GetAllocVolumes(allocID string) (*arstate.AllocVolumes, error) {
+	var entry allocVolumeStatesEntry
+
+	err := s.db.View(func(tx *boltdd.Tx) error {
+		allAllocsBkt := tx.Bucket(allocationsBucketName)
+		if allAllocsBkt == nil {
+			// No state, return
+			return nil
+		}
+
+		allocBkt := allAllocsBkt.Bucket([]byte(allocID))
+		if allocBkt == nil {
+			// No state for alloc, return
+			return nil
+		}
+
+		return allocBkt.Get(allocVolumeKey, &entry)
+	})
+
+	// It's valid for this field to be nil/missing
+	if boltdd.IsErrNotFound(err) {
+		return nil, nil
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	return entry.State, nil
+}
+
+// allocIdentitiesEntry wraps the signed identities so we can safely add more
+// state in the future without needing a new entry type
+type allocIdentitiesEntry struct {
+	Identities []*structs.SignedWorkloadIdentity
+}
+
+// PutAllocIdentities stores signed workload identities for an allocation. They
+// will be cleared when the allocation bucket is deleted.
+func (s *BoltStateDB) PutAllocIdentities(allocID string, identities []*structs.SignedWorkloadIdentity, opts ...WriteOption) error {
+
+	return s.updateWithOptions(opts, func(tx *boltdd.Tx) error {
+		allocBkt, err := getAllocationBucket(tx, allocID)
+		if err != nil {
+			return err
+		}
+
+		entry := allocIdentitiesEntry{
+			Identities: identities,
+		}
+		return allocBkt.Put(allocIdentityKey, &entry)
+	})
+}
+
+// GetAllocIdentities returns the previously-signed workload identities for an
+// allocation, if any. It's up to the caller to ensure these are still valid.
+func (s *BoltStateDB) GetAllocIdentities(allocID string) ([]*structs.SignedWorkloadIdentity, error) {
+	var entry allocIdentitiesEntry
+
+	err := s.db.View(func(tx *boltdd.Tx) error {
+		allAllocsBkt := tx.Bucket(allocationsBucketName)
+		if allAllocsBkt == nil {
+			return nil // No previous state at all
+		}
+
+		allocBkt := allAllocsBkt.Bucket([]byte(allocID))
+		if allocBkt == nil {
+			return nil // No previous state for this alloc
+		}
+
+		return allocBkt.Get(allocIdentityKey, &entry)
+	})
+
+	if boltdd.IsErrNotFound(err) {
+		return nil, nil // There may not be any previously signed identities
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	return entry.Identities, nil
 }
 
 // GetTaskRunnerState returns the LocalState and TaskState for a
@@ -895,6 +1020,73 @@ func getNodeMeta(b *boltdd.Bucket) (map[string]*string, error) {
 		}
 	}
 	return m, nil
+}
+
+func (s *BoltStateDB) PutNodeRegistration(reg *cstructs.NodeRegistration) error {
+	return s.db.Update(func(tx *boltdd.Tx) error {
+		b, err := tx.CreateBucketIfNotExists(nodeBucket)
+		if err != nil {
+			return err
+		}
+
+		return b.Put(nodeRegistrationKey, reg)
+	})
+}
+
+func (s *BoltStateDB) GetNodeRegistration() (*cstructs.NodeRegistration, error) {
+	var reg cstructs.NodeRegistration
+	err := s.db.View(func(tx *boltdd.Tx) error {
+		b := tx.Bucket(nodeBucket)
+		if b == nil {
+			return nil
+		}
+		return b.Get(nodeRegistrationKey, &reg)
+	})
+
+	if boltdd.IsErrNotFound(err) {
+		return nil, nil
+	}
+
+	return &reg, err
+}
+
+func (s *BoltStateDB) PutDynamicHostVolume(vol *cstructs.HostVolumeState) error {
+	return s.db.Update(func(tx *boltdd.Tx) error {
+		b, err := tx.CreateBucketIfNotExists(hostVolBucket)
+		if err != nil {
+			return err
+		}
+		return b.Put([]byte(vol.ID), vol)
+	})
+}
+
+func (s *BoltStateDB) GetDynamicHostVolumes() ([]*cstructs.HostVolumeState, error) {
+	var vols []*cstructs.HostVolumeState
+	err := s.db.View(func(tx *boltdd.Tx) error {
+		b := tx.Bucket(hostVolBucket)
+		if b == nil {
+			return nil
+		}
+		return b.BoltBucket().ForEach(func(k, v []byte) error {
+			var vol cstructs.HostVolumeState
+			err := b.Get(k, &vol)
+			if err != nil {
+				return err
+			}
+			vols = append(vols, &vol)
+			return nil
+		})
+	})
+	if boltdd.IsErrNotFound(err) {
+		return nil, nil
+	}
+	return vols, err
+}
+
+func (s *BoltStateDB) DeleteDynamicHostVolume(id string) error {
+	return s.db.Update(func(tx *boltdd.Tx) error {
+		return tx.Bucket(hostVolBucket).Delete([]byte(id))
+	})
 }
 
 // init initializes metadata entries in a newly created state database.

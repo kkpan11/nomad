@@ -1,6 +1,6 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 import { clickable, collection, text, attribute } from 'ember-cli-page-object';
@@ -42,5 +42,18 @@ export const singleFacet = (scope) => ({
       const parentScope = this.__parentTreeNode.scope;
       await selectChoose(parentScope, this.label);
     },
+  }),
+});
+
+export const hdsFacet = (scope) => ({
+  scope,
+
+  toggle: clickable('.hds-dropdown-toggle-button'),
+
+  options: collection('.hds-dropdown-list-item', {
+    resetScope: true,
+    label: text(),
+    key: attribute('data-test-hds-facet-option'),
+    toggle: clickable('.hds-dropdown-list-item__label'),
   }),
 });

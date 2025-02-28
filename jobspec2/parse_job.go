@@ -4,10 +4,10 @@
 package jobspec2
 
 import (
+	"slices"
 	"time"
 
 	"github.com/hashicorp/nomad/api"
-	"github.com/hashicorp/nomad/helper/pointer"
 )
 
 func normalizeJob(jc *jobConfig) {
@@ -19,7 +19,7 @@ func normalizeJob(jc *jobConfig) {
 		j.ID = &jc.JobID
 	}
 
-	if j.Periodic != nil && j.Periodic.Spec != nil {
+	if j.Periodic != nil && (j.Periodic.Spec != nil || j.Periodic.Specs != nil) {
 		v := "cron"
 		j.Periodic.SpecType = &v
 	}
@@ -53,6 +53,23 @@ func normalizeJob(jc *jobConfig) {
 			if t.Vault == nil {
 				t.Vault = jc.Vault
 			}
+
+			//COMPAT To preserve compatibility with pre-1.7 agents, move the default
+			//       identity to Task.Identity.
+			defaultIdx := -1
+			for i, wid := range t.Identities {
+				if wid.Name == "" || wid.Name == "default" {
+					t.Identity = wid
+					defaultIdx = i
+					break
+				}
+			}
+
+			// If the default identity was found in Identities above, remove it from the
+			// slice.
+			if defaultIdx >= 0 {
+				t.Identities = slices.Delete(t.Identities, defaultIdx, defaultIdx+1)
+			}
 		}
 	}
 }
@@ -63,10 +80,13 @@ func normalizeVault(v *api.Vault) {
 	}
 
 	if v.Env == nil {
-		v.Env = pointer.Of(true)
+		v.Env = pointerOf(true)
+	}
+	if v.DisableFile == nil {
+		v.DisableFile = pointerOf(false)
 	}
 	if v.ChangeMode == nil {
-		v.ChangeMode = pointer.Of("restart")
+		v.ChangeMode = pointerOf("restart")
 	}
 }
 
@@ -106,16 +126,16 @@ func normalizeTemplates(templates []*api.Template) {
 
 	for _, t := range templates {
 		if t.ChangeMode == nil {
-			t.ChangeMode = pointer.Of("restart")
+			t.ChangeMode = pointerOf("restart")
 		}
 		if t.Perms == nil {
-			t.Perms = pointer.Of("0644")
+			t.Perms = pointerOf("0644")
 		}
 		if t.Splay == nil {
-			t.Splay = pointer.Of(5 * time.Second)
+			t.Splay = pointerOf(5 * time.Second)
 		}
 		if t.ErrMissingKey == nil {
-			t.ErrMissingKey = pointer.Of(false)
+			t.ErrMissingKey = pointerOf(false)
 		}
 		normalizeChangeScript(t.ChangeScript)
 	}
@@ -131,10 +151,10 @@ func normalizeChangeScript(ch *api.ChangeScript) {
 	}
 
 	if ch.Timeout == nil {
-		ch.Timeout = pointer.Of(5 * time.Second)
+		ch.Timeout = pointerOf(5 * time.Second)
 	}
 
 	if ch.FailOnError == nil {
-		ch.FailOnError = pointer.Of(false)
+		ch.FailOnError = pointerOf(false)
 	}
 }

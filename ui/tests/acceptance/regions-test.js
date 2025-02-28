@@ -1,11 +1,11 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 /* eslint-disable qunit/require-expect */
 /* eslint-disable qunit/no-conditional-assertions */
-import { currentURL } from '@ember/test-helpers';
+import { currentURL, settled } from '@ember/test-helpers';
 import { module, test } from 'qunit';
 import { setupApplicationTest } from 'ember-qunit';
 import { selectChoose } from 'ember-power-select/test-support';
@@ -15,6 +15,7 @@ import JobsList from 'nomad-ui/tests/pages/jobs/list';
 import ClientsList from 'nomad-ui/tests/pages/clients/list';
 import Layout from 'nomad-ui/tests/pages/layout';
 import Allocation from 'nomad-ui/tests/pages/allocations/detail';
+import Tokens from 'nomad-ui/tests/pages/settings/tokens';
 
 module('Acceptance | regions (only one)', function (hooks) {
   setupApplicationTest(hooks);
@@ -22,6 +23,7 @@ module('Acceptance | regions (only one)', function (hooks) {
 
   hooks.beforeEach(function () {
     server.create('agent');
+    server.create('node-pool');
     server.create('node');
     server.createList('job', 2, {
       createAllocations: false,
@@ -34,21 +36,23 @@ module('Acceptance | regions (only one)', function (hooks) {
     await a11yAudit(assert);
   });
 
-  test('when there is only one region, the region switcher is not shown in the nav bar and the region is not in the page title', async function (assert) {
+  test('when there is only one region, and it is the default one, the region switcher is not shown in the nav bar and the region is not in the page title', async function (assert) {
     server.create('region', { id: 'global' });
 
     await JobsList.visit();
 
     assert.notOk(Layout.navbar.regionSwitcher.isPresent, 'No region switcher');
-    assert.equal(document.title, 'Jobs - Mirage - Nomad');
+    assert.notOk(Layout.navbar.singleRegion.isPresent, 'No single region');
+    assert.ok(document.title.includes('Jobs'));
   });
 
-  test('when the only region is not named "global", the region switcher still is not shown', async function (assert) {
+  test('when the only region is not named "global", the region switcher still is not shown, but the single region name is', async function (assert) {
     server.create('region', { id: 'some-region' });
 
     await JobsList.visit();
 
     assert.notOk(Layout.navbar.regionSwitcher.isPresent, 'No region switcher');
+    assert.ok(Layout.navbar.singleRegion.isPresent, 'Single region');
   });
 
   test('pages do not include the region query param', async function (assert) {
@@ -76,9 +80,11 @@ module('Acceptance | regions (only one)', function (hooks) {
     await JobsList.jobs.objectAt(0).clickRow();
     await Layout.gutter.visitClients();
     await Layout.gutter.visitServers();
-    server.pretender.handledRequests.forEach((req) => {
-      assert.notOk(req.url.includes('region='), req.url);
-    });
+    server.pretender.handledRequests
+      .filter((req) => !req.url.includes('/v1/status/leader'))
+      .forEach((req) => {
+        assert.notOk(req.url.includes('region='), req.url);
+      });
   });
 });
 
@@ -88,6 +94,7 @@ module('Acceptance | regions (many)', function (hooks) {
 
   hooks.beforeEach(function () {
     server.create('agent');
+    server.create('node-pool');
     server.create('node');
     server.createList('job', 2, {
       createAllocations: false,
@@ -105,11 +112,14 @@ module('Acceptance | regions (many)', function (hooks) {
       Layout.navbar.regionSwitcher.isPresent,
       'Region switcher is shown'
     );
-    assert.equal(document.title, 'Jobs - global - Mirage - Nomad');
+    assert.ok(document.title.includes('Jobs - global'));
   });
 
   test('when on the default region, pages do not include the region query param', async function (assert) {
+    let managementToken = server.create('token');
+    window.localStorage.nomadTokenSecret = managementToken.secretId;
     await JobsList.visit();
+    await settled();
 
     assert.equal(currentURL(), '/jobs', 'No region query param');
     assert.equal(
@@ -138,11 +148,13 @@ module('Acceptance | regions (many)', function (hooks) {
   });
 
   test('switching regions to the default region, unsets the region query param', async function (assert) {
+    let managementToken = server.create('token');
+    window.localStorage.nomadTokenSecret = managementToken.secretId;
     const startingRegion = server.db.regions[1].id;
     const defaultRegion = server.db.regions[0].id;
 
     await JobsList.visit({ region: startingRegion });
-
+    await settled();
     await selectChoose('[data-test-region-switcher-parent]', defaultRegion);
 
     assert.notOk(
@@ -154,16 +166,6 @@ module('Acceptance | regions (many)', function (hooks) {
       defaultRegion,
       'New region in localStorage'
     );
-  });
-
-  test('switching regions on deep pages redirects to the application root', async function (assert) {
-    const newRegion = server.db.regions[1].id;
-
-    await Allocation.visit({ id: server.db.allocations[0].id });
-
-    await selectChoose('[data-test-region-switcher-parent]', newRegion);
-
-    assert.ok(currentURL().includes('/jobs?'), 'Back at the jobs page');
   });
 
   test('navigating directly to a page with the region query param sets the application to that region', async function (assert) {
@@ -192,33 +194,61 @@ module('Acceptance | regions (many)', function (hooks) {
     await JobsList.jobs.objectAt(0).clickRow();
     await Layout.gutter.visitClients();
     await Layout.gutter.visitServers();
-    const [
-      ,
-      ,
-      ,
-      // License request
-      // Token/policies request
-      // Search feature detection
-      regionsRequest,
-      defaultRegionRequest,
-      ...appRequests
-    ] = server.pretender.handledRequests;
+
+    const regionsRequest = server.pretender.handledRequests.find((req) =>
+      req.responseURL.includes('/v1/regions')
+    );
+    const licenseRequest = server.pretender.handledRequests.find((req) =>
+      req.responseURL.includes('/v1/operator/license')
+    );
+    const appRequests = server.pretender.handledRequests.filter(
+      (req) =>
+        !req.responseURL.includes('/v1/regions') &&
+        !req.responseURL.includes('/v1/operator/license') &&
+        !req.responseURL.includes('/v1/status/leader')
+    );
 
     assert.notOk(
       regionsRequest.url.includes('region='),
       'The regions request is made without a region qp'
     );
     assert.notOk(
-      defaultRegionRequest.url.includes('region='),
+      licenseRequest.url.includes('region='),
       'The default region request is made without a region qp'
     );
 
     appRequests.forEach((req) => {
-      if (req.url === '/v1/agent/self') {
+      if (
+        req.url === '/v1/agent/self' ||
+        req.url === '/v1/acl/token/self' ||
+        req.url === '/v1/agent/members'
+      ) {
         assert.notOk(req.url.includes('region='), `(no region) ${req.url}`);
       } else {
         assert.ok(req.url.includes(`region=${region}`), req.url);
       }
     });
+  });
+
+  test('Signing in sets the active region', async function (assert) {
+    window.localStorage.clear();
+    let managementToken = server.create('token');
+    await Tokens.visit();
+    assert.equal(
+      Layout.navbar.regionSwitcher.text,
+      'Select a Region',
+      'Region picker says "Select a Region" before signing in'
+    );
+    await Tokens.secret(managementToken.secretId).submit();
+    assert.equal(
+      window.localStorage.nomadActiveRegion,
+      'global',
+      'Region is set in localStorage after signing in'
+    );
+    assert.equal(
+      Layout.navbar.regionSwitcher.text,
+      'Region: global',
+      'Region picker says "Region: global" after signing in'
+    );
   });
 });

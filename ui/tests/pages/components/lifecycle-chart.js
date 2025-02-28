@@ -1,6 +1,6 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 import { clickable, collection, hasClass, text } from 'ember-cli-page-object';
@@ -22,6 +22,12 @@ export default {
 
     isActive: hasClass('is-active'),
     isFinished: hasClass('is-finished'),
+
+    child: {
+      scope: '.hds-alert',
+      failed: hasClass('hds-alert--color-critical'),
+      pending: hasClass('pending'),
+    },
 
     isMain: hasClass('main'),
     isPrestartEphemeral: hasClass('prestart-ephemeral'),

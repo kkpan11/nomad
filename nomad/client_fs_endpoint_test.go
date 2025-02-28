@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package nomad
 
@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	codec "github.com/hashicorp/go-msgpack/codec"
-	msgpackrpc "github.com/hashicorp/net-rpc-msgpackrpc"
+	codec "github.com/hashicorp/go-msgpack/v2/codec"
+	msgpackrpc "github.com/hashicorp/net-rpc-msgpackrpc/v2"
 	"github.com/hashicorp/nomad/acl"
 	"github.com/hashicorp/nomad/ci"
 	"github.com/hashicorp/nomad/client"

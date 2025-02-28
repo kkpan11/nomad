@@ -1,12 +1,14 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package docker
 
 import (
 	"fmt"
 
-	docker "github.com/fsouza/go-dockerclient"
+	"github.com/docker/docker/api/types"
+	containerapi "github.com/docker/docker/api/types/container"
+	"github.com/hashicorp/nomad/helper/pointer"
 	"github.com/hashicorp/nomad/plugins/drivers"
 )
 
@@ -26,7 +28,7 @@ const (
 
 func (d *Driver) CreateNetwork(allocID string, createSpec *drivers.NetworkCreateRequest) (*drivers.NetworkIsolationSpec, bool, error) {
 	// Initialize docker API clients
-	client, _, err := d.dockerClients()
+	dockerClient, err := d.getDockerClient()
 	if err != nil {
 		return nil, false, fmt.Errorf("failed to connect to docker daemon: %s", err)
 	}
@@ -40,7 +42,7 @@ func (d *Driver) CreateNetwork(allocID string, createSpec *drivers.NetworkCreate
 		return nil, false, err
 	}
 
-	specFromContainer := func(c *docker.Container, hostname string) *drivers.NetworkIsolationSpec {
+	specFromContainer := func(c *types.ContainerJSON, hostname string) *drivers.NetworkIsolationSpec {
 		spec := &drivers.NetworkIsolationSpec{
 			Mode: drivers.NetIsolationModeGroup,
 			Path: c.NetworkSettings.SandboxKey,
@@ -68,20 +70,18 @@ func (d *Driver) CreateNetwork(allocID string, createSpec *drivers.NetworkCreate
 		return specFromContainer(container, createSpec.Hostname), false, nil
 	}
 
-	container, err = d.createContainer(client, *config, d.config.InfraImage)
+	container, err = d.createContainer(dockerClient, *config, d.config.InfraImage)
 	if err != nil {
 		return nil, false, err
 	}
 
-	if err = d.startContainer(container); err != nil {
+	if err = d.startContainer(*container); err != nil {
 		return nil, false, err
 	}
 
 	// until the container is started, InspectContainerWithOptions
 	// returns a mostly-empty struct
-	container, err = client.InspectContainerWithOptions(docker.InspectContainerOptions{
-		ID: container.ID,
-	})
+	*container, err = dockerClient.ContainerInspect(d.ctx, container.ID)
 	if err != nil {
 		return nil, false, err
 	}
@@ -93,22 +93,49 @@ func (d *Driver) CreateNetwork(allocID string, createSpec *drivers.NetworkCreate
 }
 
 func (d *Driver) DestroyNetwork(allocID string, spec *drivers.NetworkIsolationSpec) error {
-	id := spec.Labels[dockerNetSpecLabelKey]
+
+	var (
+		id  string
+		err error
+	)
+
+	if spec != nil {
+		// if we have the spec we can just read the container id
+		id = spec.Labels[dockerNetSpecLabelKey]
+	} else {
+		// otherwise we need to scan all the containers and find the pause container
+		// associated with this allocation - this happens when the client is
+		// restarted since we do not persist the network spec
+		id, err = d.findPauseContainer(allocID)
+	}
+
+	if err != nil {
+		return err
+	}
+
+	if id == "" {
+		d.logger.Debug("failed to find pause container to cleanup", "alloc_id", allocID)
+		return nil
+	}
 
 	// no longer tracking this pause container; even if we fail here we should
 	// let the background reconciliation keep trying
 	d.pauseContainers.remove(id)
 
-	client, _, err := d.dockerClients()
+	dockerClient, err := d.getDockerClient()
 	if err != nil {
 		return fmt.Errorf("failed to connect to docker daemon: %s", err)
 	}
 
-	if err := client.RemoveContainer(docker.RemoveContainerOptions{
+	// this is the pause container, just kill it fast
+	if err := dockerClient.ContainerStop(d.ctx, id, containerapi.StopOptions{Timeout: pointer.Of(1)}); err != nil {
+		d.logger.Warn("failed to stop pause container", "id", id, "error", err)
+	}
+
+	if err := dockerClient.ContainerRemove(d.ctx, id, containerapi.RemoveOptions{
 		Force: true,
-		ID:    id,
 	}); err != nil {
-		return err
+		return fmt.Errorf("failed to remove pause container: %w", err)
 	}
 
 	if d.config.GC.Image {
@@ -116,7 +143,7 @@ func (d *Driver) DestroyNetwork(allocID string, spec *drivers.NetworkIsolationSp
 		// The Docker image ID is needed in order to correctly update the image
 		// reference count. Any error finding this, however, should not result
 		// in an error shutting down the allocrunner.
-		dockerImage, err := client.InspectImage(d.config.InfraImage)
+		dockerImage, _, err := dockerClient.ImageInspectWithRaw(d.ctx, d.config.InfraImage)
 		if err != nil {
 			d.logger.Warn("InspectImage failed for infra_image container destroy",
 				"image", d.config.InfraImage, "error", err)
@@ -130,17 +157,17 @@ func (d *Driver) DestroyNetwork(allocID string, spec *drivers.NetworkIsolationSp
 
 // createSandboxContainerConfig creates a docker container configuration which
 // starts a container with an empty network namespace.
-func (d *Driver) createSandboxContainerConfig(allocID string, createSpec *drivers.NetworkCreateRequest) (*docker.CreateContainerOptions, error) {
-	return &docker.CreateContainerOptions{
+func (d *Driver) createSandboxContainerConfig(allocID string, createSpec *drivers.NetworkCreateRequest) (*createContainerOptions, error) {
+	return &createContainerOptions{
 		Name: fmt.Sprintf("nomad_init_%s", allocID),
-		Config: &docker.Config{
+		Config: &containerapi.Config{
 			Image:    d.config.InfraImage,
 			Hostname: createSpec.Hostname,
 			Labels: map[string]string{
 				dockerLabelAllocID: allocID,
 			},
 		},
-		HostConfig: &docker.HostConfig{
+		Host: &containerapi.HostConfig{
 			// Set the network mode to none which creates a network namespace
 			// with only a loopback interface.
 			NetworkMode: "none",
@@ -149,7 +176,7 @@ func (d *Driver) createSandboxContainerConfig(allocID string, createSpec *driver
 			// never not be running until Nomad issues a stop.
 			//
 			// https://docs.docker.com/engine/reference/run/#restart-policies---restart
-			RestartPolicy: docker.RestartUnlessStopped(),
+			RestartPolicy: containerapi.RestartPolicy{Name: containerapi.RestartPolicyUnlessStopped},
 		},
 	}, nil
 }
@@ -159,6 +186,11 @@ func (d *Driver) createSandboxContainerConfig(allocID string, createSpec *driver
 func (d *Driver) pullInfraImage(allocID string) error {
 	repo, tag := parseDockerImage(d.config.InfraImage)
 
+	dockerClient, err := d.getDockerClient()
+	if err != nil {
+		return err
+	}
+
 	// There's a (narrow) time-of-check-time-of-use race here. If we call
 	// InspectImage and then a concurrent task shutdown happens before we call
 	// IncrementImageReference, we could end up removing the image, and it
@@ -166,11 +198,11 @@ func (d *Driver) pullInfraImage(allocID string) error {
 	d.coordinator.imageLock.Lock()
 
 	if tag != "latest" {
-		dockerImage, err := client.InspectImage(d.config.InfraImage)
+		dockerImage, _, err := dockerClient.ImageInspectWithRaw(d.ctx, d.config.InfraImage)
 		if err != nil {
 			d.logger.Debug("InspectImage failed for infra_image container pull",
 				"image", d.config.InfraImage, "error", err)
-		} else if dockerImage != nil {
+		} else if dockerImage.ID != "" {
 			// Image exists, so no pull is attempted; just increment its reference
 			// count and unlock the image lock.
 			d.coordinator.incrementImageReferenceImpl(dockerImage.ID, d.config.InfraImage, allocID)
@@ -193,6 +225,6 @@ func (d *Driver) pullInfraImage(allocID string) error {
 		d.logger.Debug("auth failed for infra_image container pull", "image", d.config.InfraImage, "error", err)
 	}
 
-	_, err = d.coordinator.PullImage(d.config.InfraImage, authOptions, allocID, noopLogEventFn, d.config.infraImagePullTimeoutDuration, d.config.pullActivityTimeoutDuration)
+	_, _, err = d.coordinator.PullImage(d.config.InfraImage, authOptions, allocID, noopLogEventFn, d.config.infraImagePullTimeoutDuration, d.config.pullActivityTimeoutDuration)
 	return err
 }

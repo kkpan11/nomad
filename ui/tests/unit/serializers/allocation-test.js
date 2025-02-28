@@ -1,6 +1,6 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 import { module, test } from 'qunit';
@@ -48,6 +48,7 @@ module('Unit | Serializer | Allocation', function (hooks) {
                 name: 'testTask',
                 state: 'running',
                 failed: false,
+                events: [],
               },
             ],
             wasPreempted: false,
@@ -116,11 +117,13 @@ module('Unit | Serializer | Allocation', function (hooks) {
                 name: 'one.two',
                 state: 'running',
                 failed: false,
+                events: [],
               },
               {
                 name: 'three.four',
                 state: 'pending',
                 failed: true,
+                events: [],
               },
             ],
             wasPreempted: false,
@@ -190,6 +193,7 @@ module('Unit | Serializer | Allocation', function (hooks) {
                 name: 'task',
                 state: 'running',
                 failed: false,
+                events: [],
               },
             ],
             wasPreempted: true,
@@ -278,6 +282,7 @@ module('Unit | Serializer | Allocation', function (hooks) {
                 name: 'task',
                 state: 'running',
                 failed: false,
+                events: [],
               },
             ],
             wasPreempted: false,
@@ -352,11 +357,13 @@ module('Unit | Serializer | Allocation', function (hooks) {
                 name: 'abc',
                 state: 'running',
                 failed: false,
+                events: [],
               },
               {
                 name: 'xyz',
                 state: 'running',
                 failed: false,
+                events: [],
               },
             ],
             wasPreempted: false,

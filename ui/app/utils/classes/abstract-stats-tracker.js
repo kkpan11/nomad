@@ -1,6 +1,6 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 import Ember from 'ember';
@@ -43,7 +43,7 @@ export default Mixin.create({
   frameMisses: 0,
 
   handleResponse(frame) {
-    if (frame.error) {
+    if (!frame || frame.error) {
       this.incrementProperty('frameMisses');
       if (this.frameMisses >= this.maxFrameMisses) {
         // Missing enough data consecutively is effectively a pause

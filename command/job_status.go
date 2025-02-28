@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package command
 
@@ -26,11 +26,26 @@ type JobStatusCommand struct {
 	evals     bool
 	allAllocs bool
 	verbose   bool
+	json      bool
+	tmpl      string
+}
+
+// NamespacedID is a tuple of an ID and a namespace
+type NamespacedID struct {
+	ID        string
+	Namespace string
+}
+
+type JobJson struct {
+	Summary          *api.JobSummary
+	Allocations      []*api.AllocationListStub
+	LatestDeployment *api.Deployment
+	Evaluations      []*api.Evaluation
 }
 
 func (c *JobStatusCommand) Help() string {
 	helpText := `
-Usage: nomad status [options] <job>
+Usage: nomad job status [options] <job>
 
   Display status information about a job. If no job ID is given, a list of all
   known jobs will be displayed.
@@ -101,6 +116,8 @@ func (c *JobStatusCommand) Run(args []string) int {
 	flags.BoolVar(&short, "short", false, "")
 	flags.BoolVar(&c.evals, "evals", false, "")
 	flags.BoolVar(&c.allAllocs, "all-allocs", false, "")
+	flags.BoolVar(&c.json, "json", false, "")
+	flags.StringVar(&c.tmpl, "t", "", "")
 	flags.BoolVar(&c.verbose, "verbose", false, "")
 
 	if err := flags.Parse(args); err != nil {
@@ -143,7 +160,29 @@ func (c *JobStatusCommand) Run(args []string) int {
 			// No output if we have no jobs
 			c.Ui.Output("No running jobs")
 		} else {
-			c.Ui.Output(createStatusListOutput(jobs, allNamespaces))
+			if c.json || len(c.tmpl) > 0 {
+				pairs := make([]NamespacedID, len(jobs))
+
+				for i, j := range jobs {
+					pairs[i] = NamespacedID{ID: j.ID, Namespace: j.Namespace}
+				}
+
+				jsonJobs, err := createJsonJobsOutput(client, c.allAllocs, pairs...)
+				if err != nil {
+					c.Ui.Error(err.Error())
+					return 1
+				}
+
+				out, err := Format(c.json, c.tmpl, jsonJobs)
+				if err != nil {
+					c.Ui.Error(err.Error())
+					return 1
+				}
+
+				c.Ui.Output(out)
+			} else {
+				c.Ui.Output(createStatusListOutput(jobs, allNamespaces))
+			}
 		}
 		return 0
 	}
@@ -167,6 +206,31 @@ func (c *JobStatusCommand) Run(args []string) int {
 	periodic := job.IsPeriodic()
 	parameterized := job.IsParameterized()
 
+	nodePool := ""
+	if job.NodePool != nil {
+		nodePool = *job.NodePool
+	}
+
+	if c.json || len(c.tmpl) > 0 {
+		jsonJobs, err := createJsonJobsOutput(client, c.allAllocs,
+			NamespacedID{ID: *job.ID, Namespace: *job.Namespace})
+
+		if err != nil {
+			c.Ui.Error(err.Error())
+			return 1
+		}
+
+		out, err := Format(c.json, c.tmpl, jsonJobs)
+		if err != nil {
+			c.Ui.Error(err.Error())
+			return 1
+		}
+
+		c.Ui.Output(out)
+
+		return 0
+	}
+
 	// Format the job info
 	basic := []string{
 		fmt.Sprintf("ID|%s", *job.ID),
@@ -176,7 +240,7 @@ func (c *JobStatusCommand) Run(args []string) int {
 		fmt.Sprintf("Priority|%d", *job.Priority),
 		fmt.Sprintf("Datacenters|%s", strings.Join(job.Datacenters, ",")),
 		fmt.Sprintf("Namespace|%s", *job.Namespace),
-		fmt.Sprintf("Node Pool|%s", *job.NodePool),
+		fmt.Sprintf("Node Pool|%s", nodePool),
 		fmt.Sprintf("Status|%s", getStatusString(*job.Status, job.Stop)),
 		fmt.Sprintf("Periodic|%v", periodic),
 		fmt.Sprintf("Parameterized|%v", parameterized),
@@ -342,6 +406,19 @@ func (c *JobStatusCommand) outputJobInfo(client *api.Client, job *api.Job) error
 		return fmt.Errorf("Error querying latest job deployment: %s", err)
 	}
 
+	jobActions := make([]map[string]string, 0)
+	for _, tg := range job.TaskGroups {
+		for _, task := range tg.Tasks {
+			for _, action := range task.Actions {
+				jobActions = append(jobActions, map[string]string{
+					"group":  *tg.Name,
+					"task":   task.Name,
+					"action": action.Name,
+				})
+			}
+		}
+	}
+
 	// Output the summary
 	if err := c.outputJobSummary(client, job); err != nil {
 		return err
@@ -395,6 +472,11 @@ func (c *JobStatusCommand) outputJobInfo(client *api.Client, job *api.Job) error
 		c.Ui.Output(c.Colorize().Color(c.formatDeployment(client, latestDeployment)))
 	}
 
+	if len(jobActions) > 0 {
+		c.Ui.Output(c.Colorize().Color("\n[bold]Actions[reset]"))
+		c.Ui.Output(formatJobActions(jobActions))
+	}
+
 	// Format the allocs
 	c.Ui.Output(c.Colorize().Color("\n[bold]Allocations[reset]"))
 	c.Ui.Output(formatAllocListStubs(jobAllocs, c.verbose, c.length))
@@ -427,6 +509,29 @@ func (c *JobStatusCommand) formatDeployment(client *api.Client, d *api.Deploymen
 	base += "\n\n[bold]Deployed[reset]\n"
 	base += formatDeploymentGroups(d, c.length)
 	return base
+}
+
+func formatJobActions(actions []map[string]string) string {
+	if len(actions) == 0 {
+		return "No actions configured"
+	}
+
+	actionsOut := make([]string, len(actions)+1)
+	actionsOut[0] = "Action Name|Task Group|Task"
+
+	for i, action := range actions {
+		group, task, actionName := action["group"], action["task"], action["action"]
+		if group == "" || task == "" || actionName == "" {
+			continue
+		}
+
+		actionsOut[i+1] = fmt.Sprintf("%s|%s|%s",
+			actionName,
+			group,
+			task)
+	}
+
+	return formatList(actionsOut)
 }
 
 func formatAllocListStubs(stubs []*api.AllocationListStub, verbose bool, uuidLength int) string {
@@ -659,6 +764,43 @@ func (c *JobStatusCommand) outputFailedPlacements(failedEval *api.Evaluation) {
 		trunc := fmt.Sprintf("\nPlacement failures truncated. To see remainder run:\nnomad eval-status %s", failedEval.ID)
 		c.Ui.Output(trunc)
 	}
+}
+
+func createJsonJobsOutput(client *api.Client, allAllocs bool, jobs ...NamespacedID) ([]JobJson, error) {
+	jsonJobs := make([]JobJson, len(jobs))
+
+	for i, pair := range jobs {
+		q := &api.QueryOptions{Namespace: pair.Namespace}
+
+		summary, _, err := client.Jobs().Summary(pair.ID, q)
+		if err != nil {
+			return nil, fmt.Errorf("Error querying job summary: %s", err)
+		}
+
+		allocations, _, err := client.Jobs().Allocations(pair.ID, allAllocs, q)
+		if err != nil {
+			return nil, fmt.Errorf("Error querying job allocations: %s", err)
+		}
+
+		latestDeployment, _, err := client.Jobs().LatestDeployment(pair.ID, q)
+		if err != nil {
+			return nil, fmt.Errorf("Error querying latest job deployment: %s", err)
+		}
+
+		evals, _, err := client.Jobs().Evaluations(pair.ID, q)
+		if err != nil {
+			return nil, fmt.Errorf("Error querying job evaluations: %s", err)
+		}
+
+		jsonJobs[i] = JobJson{
+			Summary:          summary,
+			Allocations:      allocations,
+			LatestDeployment: latestDeployment,
+			Evaluations:      evals,
+		}
+	}
+
+	return jsonJobs, nil
 }
 
 // list general information about a list of jobs

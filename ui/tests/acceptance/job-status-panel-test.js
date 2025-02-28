@@ -1,6 +1,6 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 // @ts-check
@@ -28,6 +28,7 @@ module('Acceptance | job status panel', function (hooks) {
   setupMirage(hooks);
 
   hooks.beforeEach(async function () {
+    server.create('node-pool');
     server.create('node');
   });
 
@@ -38,6 +39,7 @@ module('Acceptance | job status panel', function (hooks) {
       datacenters: ['*'],
       type: 'service',
       createAllocations: true,
+      noDeployments: true,
     });
 
     await visit(`/jobs/${job.id}`);
@@ -73,6 +75,7 @@ module('Acceptance | job status panel', function (hooks) {
       datacenters: ['*'],
       type: 'service',
       createAllocations: true,
+      noActiveDeployment: true,
     });
 
     await visit(`/jobs/${job.id}?statusMode=historical`);
@@ -88,7 +91,7 @@ module('Acceptance | job status panel', function (hooks) {
 
     faker.seed(1);
 
-    let groupTaskCount = 10;
+    let groupAllocCount = 10;
 
     let job = server.create('job', {
       status: 'running',
@@ -102,7 +105,7 @@ module('Acceptance | job status panel', function (hooks) {
         unknown: 0,
         lost: 0,
       },
-      groupTaskCount,
+      groupAllocCount,
       shallow: true,
     });
 
@@ -115,7 +118,7 @@ module('Acceptance | job status panel', function (hooks) {
 
     assert.equal(
       jobAllocCount,
-      groupTaskCount * job.taskGroups.length,
+      groupAllocCount * job.taskGroups.length,
       'Correect number of allocs generated (metatest)'
     );
     assert
@@ -125,7 +128,7 @@ module('Acceptance | job status panel', function (hooks) {
         `All ${jobAllocCount} allocations are represented in the status panel`
       );
 
-    groupTaskCount = 20;
+    groupAllocCount = 20;
 
     job = server.create('job', {
       status: 'running',
@@ -139,7 +142,7 @@ module('Acceptance | job status panel', function (hooks) {
         unknown: 0,
         lost: 0,
       },
-      groupTaskCount,
+      groupAllocCount,
       noActiveDeployment: true,
       shallow: true,
     });
@@ -159,7 +162,7 @@ module('Acceptance | job status panel', function (hooks) {
 
     assert.equal(
       runningAllocCount + failedAllocCount,
-      groupTaskCount * job.taskGroups.length,
+      groupAllocCount * job.taskGroups.length,
       'Correect number of allocs generated (metatest)'
     );
     assert
@@ -189,7 +192,7 @@ module('Acceptance | job status panel', function (hooks) {
       type: 'service',
       resourceSpec: ['M: 256, C: 500'], // a single group
       createAllocations: false,
-      groupTaskCount: 4,
+      groupAllocCount: 4,
       shallow: true,
       version: 5,
     });
@@ -223,7 +226,7 @@ module('Acceptance | job status panel', function (hooks) {
     await visit(`/jobs/${job.id}`);
     assert.dom('.job-status-panel').exists();
 
-    // We expect to see 4 represented-allocations, since that's the number in our groupTaskCount
+    // We expect to see 4 represented-allocations, since that's the number in our groupAllocCount
     assert
       .dom('.ungrouped-allocs .represented-allocation')
       .exists({ count: 4 });
@@ -274,7 +277,7 @@ module('Acceptance | job status panel', function (hooks) {
         lost: 0,
         complete: 0.2,
       },
-      groupTaskCount: 5,
+      groupAllocCount: 5,
       shallow: true,
       version: 5,
       noActiveDeployment: true,
@@ -313,7 +316,7 @@ module('Acceptance | job status panel', function (hooks) {
 
     await visit(`/jobs/${job.id}`);
     assert.dom('.job-status-panel').exists();
-    // We expect to see 5 represented-allocations, since that's the number in our groupTaskCount
+    // We expect to see 5 represented-allocations, since that's the number in our groupAllocCount
     assert
       .dom('.ungrouped-allocs .represented-allocation')
       .exists({ count: 5 });
@@ -351,7 +354,7 @@ module('Acceptance | job status panel', function (hooks) {
 
     faker.seed(1);
 
-    let groupTaskCount = 20;
+    let groupAllocCount = 20;
 
     let job = server.create('job', {
       status: 'running',
@@ -365,7 +368,7 @@ module('Acceptance | job status panel', function (hooks) {
         unknown: 0,
         lost: 0,
       },
-      groupTaskCount,
+      groupAllocCount,
       shallow: true,
     });
 
@@ -383,7 +386,7 @@ module('Acceptance | job status panel', function (hooks) {
         `All ${jobAllocCount} allocations are represented in the status panel, ungrouped`
       );
 
-    groupTaskCount = 40;
+    groupAllocCount = 40;
 
     job = server.create('job', {
       status: 'running',
@@ -397,7 +400,7 @@ module('Acceptance | job status panel', function (hooks) {
         unknown: 0,
         lost: 0,
       },
-      groupTaskCount,
+      groupAllocCount,
       shallow: true,
     });
 
@@ -423,7 +426,7 @@ module('Acceptance | job status panel', function (hooks) {
     assert
       .dom('.represented-allocation.rest')
       .hasText(
-        `+${groupTaskCount - desiredUngroupedAllocCount}`,
+        `+${groupAllocCount - desiredUngroupedAllocCount}`,
         'Summary block has the correct number of grouped allocs'
       );
 
@@ -435,7 +438,7 @@ module('Acceptance | job status panel', function (hooks) {
   });
 
   test('Status Panel groups allocations when they get past a threshold, multiple statuses', async function (assert) {
-    let groupTaskCount = 50;
+    let groupAllocCount = 50;
 
     let job = server.create('job', {
       status: 'running',
@@ -449,7 +452,7 @@ module('Acceptance | job status panel', function (hooks) {
         pending: 0.1,
         unknown: 0.1,
       },
-      groupTaskCount,
+      groupAllocCount,
       shallow: true,
     });
 
@@ -527,6 +530,7 @@ module('Acceptance | job status panel', function (hooks) {
       {
         percyCSS: `
           .allocation-row td { display: none; }
+          .inline-chart { visibility: hidden; }
         `,
       }
     );
@@ -542,6 +546,7 @@ module('Acceptance | job status panel', function (hooks) {
       {
         percyCSS: `
           .allocation-row td { display: none; }
+          .inline-chart { visibility: hidden; }
         `,
       }
     );
@@ -585,6 +590,7 @@ module('Acceptance | job status panel', function (hooks) {
       {
         percyCSS: `
           .allocation-row td { display: none; }
+          .inline-chart { visibility: hidden; }
         `,
       }
     );
@@ -623,7 +629,7 @@ module('Acceptance | job status panel', function (hooks) {
   test('Restarted/Rescheduled/Failed numbers reflected correctly', async function (assert) {
     this.store = this.owner.lookup('service:store');
 
-    let groupTaskCount = 10;
+    let groupAllocCount = 10;
 
     let job = server.create('job', {
       status: 'running',
@@ -637,7 +643,7 @@ module('Acceptance | job status panel', function (hooks) {
         unknown: 0,
         lost: 0,
       },
-      groupTaskCount,
+      groupAllocCount,
       activeDeployment: true,
       shallow: true,
       version: 0,
@@ -744,7 +750,7 @@ module('Acceptance | job status panel', function (hooks) {
     test('Deployment history can be searched', async function (assert) {
       faker.seed(1);
 
-      let groupTaskCount = 10;
+      let groupAllocCount = 10;
 
       let job = server.create('job', {
         status: 'running',
@@ -758,7 +764,7 @@ module('Acceptance | job status panel', function (hooks) {
           unknown: 0,
           lost: 0,
         },
-        groupTaskCount,
+        groupAllocCount,
         shallow: true,
         activeDeployment: true,
         version: 0,
@@ -788,7 +794,7 @@ module('Acceptance | job status panel', function (hooks) {
 
       await fillIn(
         '[data-test-history-search] input',
-        serverEvents.models[0].message
+        serverEvents.models[0].displayMessage
       );
       assert.equal(
         findAll('.timeline-object').length,
@@ -819,7 +825,8 @@ module('Acceptance | job status panel', function (hooks) {
           lost: 0,
           complete: 0.2,
         },
-        groupTaskCount: 10,
+        groupsCount: 1,
+        groupAllocCount: 10,
         noActiveDeployment: true,
         shallow: true,
         version: 1,
@@ -837,7 +844,8 @@ module('Acceptance | job status panel', function (hooks) {
           lost: 0,
           complete: 0.2,
         },
-        groupTaskCount: 10,
+        groupsCount: 1,
+        groupAllocCount: 10,
         noActiveDeployment: true,
         shallow: true,
         version: 1,
@@ -971,19 +979,6 @@ module('Acceptance | job status panel', function (hooks) {
         'job',
         JSON.stringify([job.id, 'default'])
       );
-      // Weird Mirage thing: job summary factory is disconnected from its job and therefore allocations.
-      // So we manually create the number here.
-      let summary = await storedJob.get('summary');
-      summary
-        .get('taskGroupSummaries')
-        .objectAt(0)
-        .set(
-          'runningAllocs',
-          server.schema.allocations.where({
-            jobId: job.id,
-            clientStatus: 'running',
-          }).length
-        );
 
       await settled();
 
@@ -1012,17 +1007,8 @@ module('Acceptance | job status panel', function (hooks) {
         nodeId: newNode.id,
       });
 
-      summary
-        .get('taskGroupSummaries')
-        .objectAt(0)
-        .set(
-          'runningAllocs',
-          server.schema.allocations.where({
-            jobId: job.id,
-            clientStatus: 'running',
-          }).length
-        );
-
+      // simulate a blocking query update from /allocations
+      storedJob.allocations.reload();
       await settled();
 
       assert.dom('.running-allocs-title').hasText('4 Allocations Running');

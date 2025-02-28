@@ -1,6 +1,6 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 /* eslint-disable ember/no-observers */
@@ -22,6 +22,7 @@ export default class ApplicationController extends Controller {
   @service system;
   @service token;
   @service notifications;
+  @service router;
 
   /**
    * @type {KeyboardService}

@@ -1,6 +1,6 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 import { currentURL, visit } from '@ember/test-helpers';
@@ -21,6 +21,7 @@ module('Acceptance | application errors ', function (hooks) {
   hooks.beforeEach(function () {
     faker.seed(1);
     server.create('agent');
+    server.create('node-pool');
     server.create('node');
     server.create('job');
   });
@@ -69,7 +70,11 @@ module('Acceptance | application errors ', function (hooks) {
 
   test('the no leader error state gets its own error message', async function (assert) {
     assert.expect(2);
-    server.pretender.get('/v1/jobs', () => [500, {}, 'No cluster leader']);
+    server.pretender.get('/v1/jobs/statuses', () => [
+      500,
+      {},
+      'No cluster leader',
+    ]);
 
     await JobsList.visit();
 

@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package state
 
@@ -15,16 +15,21 @@ import (
 const (
 	tableIndex = "index"
 
-	TableNamespaces           = "namespaces"
-	TableNodePools            = "node_pools"
-	TableServiceRegistrations = "service_registrations"
-	TableVariables            = "variables"
-	TableVariablesQuotas      = "variables_quota"
-	TableRootKeyMeta          = "root_key_meta"
-	TableACLRoles             = "acl_roles"
-	TableACLAuthMethods       = "acl_auth_methods"
-	TableACLBindingRules      = "acl_binding_rules"
-	TableAllocs               = "allocs"
+	TableNamespaces               = "namespaces"
+	TableNodePools                = "node_pools"
+	TableServiceRegistrations     = "service_registrations"
+	TableVariables                = "variables"
+	TableVariablesQuotas          = "variables_quota"
+	TableRootKeys                 = "root_keys"
+	TableACLRoles                 = "acl_roles"
+	TableACLAuthMethods           = "acl_auth_methods"
+	TableACLBindingRules          = "acl_binding_rules"
+	TableAllocs                   = "allocs"
+	TableJobSubmission            = "job_submission"
+	TableHostVolumes              = "host_volumes"
+	TableCSIVolumes               = "csi_volumes"
+	TableCSIPlugins               = "csi_plugins"
+	TableTaskGroupHostVolumeClaim = "task_volume"
 )
 
 const (
@@ -40,6 +45,8 @@ const (
 	indexName          = "name"
 	indexSigningKey    = "signing_key"
 	indexAuthMethod    = "auth_method"
+	indexNodePool      = "node_pool"
+	indexClaimID       = "claim_id"
 )
 
 var (
@@ -92,10 +99,12 @@ func init() {
 		serviceRegistrationsTableSchema,
 		variablesTableSchema,
 		variablesQuotasTableSchema,
-		variablesRootKeyMetaSchema,
+		wrappedRootKeySchema,
 		aclRolesTableSchema,
 		aclAuthMethodsTableSchema,
 		bindingRulesTableSchema,
+		hostVolumeTableSchema,
+		taskGroupHostVolumeClaimSchema,
 	}...)
 }
 
@@ -158,6 +167,14 @@ func nodeTableSchema() *memdb.TableSchema {
 				Unique:       true,
 				Indexer: &memdb.UUIDFieldIndex{
 					Field: "SecretID",
+				},
+			},
+			indexNodePool: {
+				Name:         indexNodePool,
+				AllowMissing: false,
+				Unique:       false,
+				Indexer: &memdb.StringFieldIndex{
+					Field: "NodePool",
 				},
 			},
 		},
@@ -237,6 +254,23 @@ func jobTableSchema() *memdb.TableSchema {
 					Conditional: jobIsPeriodic,
 				},
 			},
+			"pool": {
+				Name:         "pool",
+				AllowMissing: false,
+				Unique:       false,
+				Indexer: &memdb.StringFieldIndex{
+					Field: "NodePool",
+				},
+			},
+			// ModifyIndex allows sorting by last-changed
+			"modify_index": {
+				Name:         "modify_index",
+				AllowMissing: false,
+				Unique:       true,
+				Indexer: &memdb.UintFieldIndex{
+					Field: "ModifyIndex",
+				},
+			},
 		},
 	}
 }
@@ -307,7 +341,7 @@ func jobVersionSchema() *memdb.TableSchema {
 // which contain the original source material of each job, per version.
 func jobSubmissionSchema() *memdb.TableSchema {
 	return &memdb.TableSchema{
-		Name: "job_submission",
+		Name: TableJobSubmission,
 		Indexes: map[string]*memdb.IndexSchema{
 			"id": {
 				Name:         "id",
@@ -344,6 +378,11 @@ func jobIsGCable(obj interface{}) (bool, error) {
 	j, ok := obj.(*structs.Job)
 	if !ok {
 		return false, fmt.Errorf("Unexpected type: %v", obj)
+	}
+
+	// job versions that are tagged should be kept
+	if j.VersionTag != nil {
+		return false, nil
 	}
 
 	// If the job is periodic or parameterized it is only garbage collectable if
@@ -813,8 +852,8 @@ func vaultAccessorTableSchema() *memdb.TableSchema {
 				},
 			},
 
-			"node_id": {
-				Name:         "node_id",
+			indexNodeID: {
+				Name:         indexNodeID,
 				AllowMissing: false,
 				Unique:       false,
 				Indexer: &memdb.StringFieldIndex{
@@ -851,8 +890,8 @@ func siTokenAccessorTableSchema() *memdb.TableSchema {
 				},
 			},
 
-			"node_id": {
-				Name:         "node_id",
+			indexNodeID: {
+				Name:         indexNodeID,
 				AllowMissing: false,
 				Unique:       false,
 				Indexer: &memdb.StringFieldIndex{
@@ -910,7 +949,7 @@ func (a *ACLPolicyJobACLFieldIndex) FromObject(obj interface{}) (bool, []byte, e
 	jobID := policy.JobACL.JobID
 	if jobID == "" {
 		return false, nil, fmt.Errorf(
-			"object %#v is not a valid ACLPolicy: JobACL.JobID without Namespace", obj)
+			"object %#v is not a valid ACLPolicy: Namespace without JobID", obj)
 	}
 
 	val := ns + "\x00" + jobID + "\x00"
@@ -1116,7 +1155,7 @@ func clusterMetaTableSchema() *memdb.TableSchema {
 // CSIVolumes are identified by id globally, and searchable by driver
 func csiVolumeTableSchema() *memdb.TableSchema {
 	return &memdb.TableSchema{
-		Name: "csi_volumes",
+		Name: TableCSIVolumes,
 		Indexes: map[string]*memdb.IndexSchema{
 			"id": {
 				Name:         "id",
@@ -1148,7 +1187,7 @@ func csiVolumeTableSchema() *memdb.TableSchema {
 // CSIPlugins are identified by id globally, and searchable by driver
 func csiPluginTableSchema() *memdb.TableSchema {
 	return &memdb.TableSchema{
-		Name: "csi_plugins",
+		Name: TableCSIPlugins,
 		Indexes: map[string]*memdb.IndexSchema{
 			"id": {
 				Name:         "id",
@@ -1162,7 +1201,7 @@ func csiPluginTableSchema() *memdb.TableSchema {
 	}
 }
 
-// StringFieldIndex is used to extract a field from an object
+// ScalingPolicyTargetFieldIndex is used to extract a field from an object
 // using reflection and builds an index on that field.
 type ScalingPolicyTargetFieldIndex struct {
 	Field string
@@ -1317,16 +1356,6 @@ func scalingEventTableSchema() *memdb.TableSchema {
 					},
 				},
 			},
-
-			// TODO: need to figure out whether we want to index these or the jobs or ...
-			// "error": {
-			// 	Name:         "error",
-			// 	AllowMissing: false,
-			// 	Unique:       false,
-			// 	Indexer: &memdb.FieldSetIndex{
-			// 		Field: "Error",
-			// 	},
-			// },
 		},
 	}
 }
@@ -1541,10 +1570,10 @@ func variablesQuotasTableSchema() *memdb.TableSchema {
 	}
 }
 
-// variablesRootKeyMetaSchema returns the MemDB schema for Nomad root keys
-func variablesRootKeyMetaSchema() *memdb.TableSchema {
+// wrappedRootKeySchema returns the MemDB schema for wrapped Nomad root keys
+func wrappedRootKeySchema() *memdb.TableSchema {
 	return &memdb.TableSchema{
-		Name: TableRootKeyMeta,
+		Name: TableRootKeys,
 		Indexes: map[string]*memdb.IndexSchema{
 			indexID: {
 				Name:         indexID,
@@ -1617,6 +1646,107 @@ func bindingRulesTableSchema() *memdb.TableSchema {
 				Unique:       false,
 				Indexer: &memdb.StringFieldIndex{
 					Field: "AuthMethod",
+				},
+			},
+		},
+	}
+}
+
+// HostVolumes are identified by id globally, and searchable by namespace+name,
+// node, or node_pool
+func hostVolumeTableSchema() *memdb.TableSchema {
+	return &memdb.TableSchema{
+		Name: TableHostVolumes,
+		Indexes: map[string]*memdb.IndexSchema{
+			indexID: {
+				Name:         indexID,
+				AllowMissing: false,
+				Unique:       true,
+				Indexer: &memdb.CompoundIndex{
+					Indexes: []memdb.Indexer{
+						&memdb.StringFieldIndex{
+							Field: "Namespace",
+						},
+						&memdb.StringFieldIndex{
+							Field:     "ID",
+							Lowercase: true,
+						},
+					},
+				},
+			},
+			indexName: {
+				Name:         indexName,
+				AllowMissing: false,
+				Unique:       false,
+				Indexer: &memdb.CompoundIndex{
+					Indexes: []memdb.Indexer{
+						&memdb.StringFieldIndex{
+							Field: "Namespace",
+						},
+						&memdb.StringFieldIndex{
+							Field: "Name",
+						},
+					},
+				},
+			},
+			indexNodeID: {
+				Name:         indexNodeID,
+				AllowMissing: false,
+				Unique:       false,
+				Indexer: &memdb.StringFieldIndex{
+					Field:     "NodeID",
+					Lowercase: true,
+				},
+			},
+			indexNodePool: {
+				Name:         indexNodePool,
+				AllowMissing: false,
+				Unique:       false,
+				Indexer: &memdb.StringFieldIndex{
+					Field: "NodePool",
+				},
+			},
+		},
+	}
+}
+
+func taskGroupHostVolumeClaimSchema() *memdb.TableSchema {
+	return &memdb.TableSchema{
+		Name: TableTaskGroupHostVolumeClaim,
+		Indexes: map[string]*memdb.IndexSchema{
+			indexID: {
+				Name:         indexID,
+				AllowMissing: false,
+				Unique:       true,
+
+				// Use a compound index so the combination of (Namespace, JobID, TaskGroupName,
+				// VolumeID) is uniquely identifying
+				Indexer: &memdb.CompoundIndex{
+					Indexes: []memdb.Indexer{
+						&memdb.StringFieldIndex{
+							Field: "Namespace",
+						},
+
+						&memdb.StringFieldIndex{
+							Field: "JobID",
+						},
+
+						&memdb.StringFieldIndex{
+							Field: "TaskGroupName",
+						},
+
+						&memdb.StringFieldIndex{
+							Field: "VolumeID",
+						},
+					},
+				},
+			},
+			indexClaimID: {
+				Name:         indexClaimID,
+				AllowMissing: false,
+				Unique:       true,
+				Indexer: &memdb.StringFieldIndex{
+					Field: "ID",
 				},
 			},
 		},

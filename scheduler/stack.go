@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package scheduler
 
@@ -35,10 +35,11 @@ type Stack interface {
 }
 
 type SelectOptions struct {
-	PenaltyNodeIDs map[string]struct{}
-	PreferredNodes []*structs.Node
-	Preempt        bool
-	AllocName      string
+	PenaltyNodeIDs          map[string]struct{}
+	PreferredNodes          []*structs.Node
+	Preempt                 bool
+	AllocName               string
+	AllocationHostVolumeIDs []string
 }
 
 // GenericStack is the Stack used for the Generic scheduler. It is
@@ -51,6 +52,8 @@ type GenericStack struct {
 	wrappedChecks        *FeasibilityWrapper
 	quota                FeasibleIterator
 	jobVersion           *uint64
+	jobNamespace         string
+	jobID                string
 	jobConstraint        *ConstraintChecker
 	taskGroupDrivers     *DriverChecker
 	taskGroupConstraint  *ConstraintChecker
@@ -101,6 +104,8 @@ func (s *GenericStack) SetJob(job *structs.Job) {
 
 	jobVer := job.Version
 	s.jobVersion = &jobVer
+	s.jobNamespace = job.Namespace
+	s.jobID = job.ID
 
 	s.jobConstraint.SetConstraints(job.Constraints)
 	s.distinctHostsConstraint.SetJob(job)
@@ -116,6 +121,13 @@ func (s *GenericStack) SetJob(job *structs.Job) {
 	if contextual, ok := s.quota.(ContextualIterator); ok {
 		contextual.SetJob(job)
 	}
+}
+
+// SetSchedulerConfiguration applies the given scheduler configuration to
+// process nodes. Scheduler configuration values may change per job depending
+// on the node pool being used.
+func (s *GenericStack) SetSchedulerConfiguration(schedConfig *structs.SchedulerConfiguration) {
+	s.binPack.SetSchedulerConfiguration(schedConfig)
 }
 
 func (s *GenericStack) Select(tg *structs.TaskGroup, options *SelectOptions) *RankedNode {
@@ -147,7 +159,7 @@ func (s *GenericStack) Select(tg *structs.TaskGroup, options *SelectOptions) *Ra
 	s.taskGroupDrivers.SetDrivers(tgConstr.drivers)
 	s.taskGroupConstraint.SetConstraints(tgConstr.constraints)
 	s.taskGroupDevices.SetTaskGroup(tg)
-	s.taskGroupHostVolumes.SetVolumes(options.AllocName, tg.Volumes)
+	s.taskGroupHostVolumes.SetVolumes(options.AllocName, s.jobNamespace, s.jobID, tg.Name, tg.Volumes)
 	s.taskGroupCSIVolumes.SetVolumes(options.AllocName, tg.Volumes)
 	if len(tg.Networks) > 0 {
 		s.taskGroupNetwork.SetNetwork(tg.Networks[0])
@@ -195,6 +207,8 @@ type SystemStack struct {
 	ctx    Context
 	source *StaticIterator
 
+	jobNamespace         string
+	jobID                string
 	wrappedChecks        *FeasibilityWrapper
 	quota                FeasibleIterator
 	jobConstraint        *ConstraintChecker
@@ -252,11 +266,13 @@ func NewSystemStack(sysbatch bool, ctx Context) *SystemStack {
 	tgs := []FeasibilityChecker{
 		s.taskGroupDrivers,
 		s.taskGroupConstraint,
-		s.taskGroupHostVolumes,
 		s.taskGroupDevices,
 		s.taskGroupNetwork,
 	}
-	avail := []FeasibilityChecker{s.taskGroupCSIVolumes}
+	avail := []FeasibilityChecker{
+		s.taskGroupHostVolumes,
+		s.taskGroupCSIVolumes,
+	}
 	s.wrappedChecks = NewFeasibilityWrapper(ctx, s.source, jobs, tgs, avail)
 
 	// Filter on distinct property constraints.
@@ -275,6 +291,11 @@ func NewSystemStack(sysbatch bool, ctx Context) *SystemStack {
 	// Apply the bin packing, this depends on the resources needed
 	// by a particular task group. Enable eviction as system jobs are high
 	// priority.
+	//
+	// The scheduler configuration is read directly from state but only
+	// values that can't be specified per node pool should be used. Other
+	// values must be merged by calling schedConfig.WithNodePool() and set in
+	// the stack by calling SetSchedulerConfiguration().
 	_, schedConfig, _ := s.ctx.State().SchedulerConfig()
 	enablePreemption := true
 	if schedConfig != nil {
@@ -286,7 +307,7 @@ func NewSystemStack(sysbatch bool, ctx Context) *SystemStack {
 	}
 
 	// Create binpack iterator
-	s.binPack = NewBinPackIterator(ctx, rankSource, enablePreemption, 0, schedConfig)
+	s.binPack = NewBinPackIterator(ctx, rankSource, enablePreemption, 0)
 
 	// Apply score normalization
 	s.scoreNorm = NewScoreNormalizationIterator(ctx, s.binPack)
@@ -299,6 +320,8 @@ func (s *SystemStack) SetNodes(baseNodes []*structs.Node) {
 }
 
 func (s *SystemStack) SetJob(job *structs.Job) {
+	s.jobNamespace = job.Namespace
+	s.jobID = job.ID
 	s.jobConstraint.SetConstraints(job.Constraints)
 	s.distinctPropertyConstraint.SetJob(job)
 	s.binPack.SetJob(job)
@@ -309,6 +332,13 @@ func (s *SystemStack) SetJob(job *structs.Job) {
 	if contextual, ok := s.quota.(ContextualIterator); ok {
 		contextual.SetJob(job)
 	}
+}
+
+// SetSchedulerConfiguration applies the given scheduler configuration to
+// process nodes. Scheduler configuration values may change per job depending
+// on the node pool being used.
+func (s *SystemStack) SetSchedulerConfiguration(schedConfig *structs.SchedulerConfiguration) {
+	s.binPack.SetSchedulerConfiguration(schedConfig)
 }
 
 func (s *SystemStack) Select(tg *structs.TaskGroup, options *SelectOptions) *RankedNode {
@@ -324,7 +354,7 @@ func (s *SystemStack) Select(tg *structs.TaskGroup, options *SelectOptions) *Ran
 	s.taskGroupDrivers.SetDrivers(tgConstr.drivers)
 	s.taskGroupConstraint.SetConstraints(tgConstr.constraints)
 	s.taskGroupDevices.SetTaskGroup(tg)
-	s.taskGroupHostVolumes.SetVolumes(options.AllocName, tg.Volumes)
+	s.taskGroupHostVolumes.SetVolumes(options.AllocName, s.jobNamespace, s.jobID, tg.Name, tg.Volumes)
 	s.taskGroupCSIVolumes.SetVolumes(options.AllocName, tg.Volumes)
 	if len(tg.Networks) > 0 {
 		s.taskGroupNetwork.SetNetwork(tg.Networks[0])
@@ -387,11 +417,13 @@ func NewGenericStack(batch bool, ctx Context) *GenericStack {
 	tgs := []FeasibilityChecker{
 		s.taskGroupDrivers,
 		s.taskGroupConstraint,
-		s.taskGroupHostVolumes,
 		s.taskGroupDevices,
 		s.taskGroupNetwork,
 	}
-	avail := []FeasibilityChecker{s.taskGroupCSIVolumes}
+	avail := []FeasibilityChecker{
+		s.taskGroupHostVolumes,
+		s.taskGroupCSIVolumes,
+	}
 	s.wrappedChecks = NewFeasibilityWrapper(ctx, s.source, jobs, tgs, avail)
 
 	// Filter on distinct host constraints.
@@ -412,8 +444,7 @@ func NewGenericStack(batch bool, ctx Context) *GenericStack {
 
 	// Apply the bin packing, this depends on the resources needed
 	// by a particular task group.
-	_, schedConfig, _ := ctx.State().SchedulerConfig()
-	s.binPack = NewBinPackIterator(ctx, rankSource, false, 0, schedConfig)
+	s.binPack = NewBinPackIterator(ctx, rankSource, false, 0)
 
 	// Apply the job anti-affinity iterator. This is to avoid placing
 	// multiple allocations on the same node for this job.

@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package structs
 
@@ -17,23 +17,26 @@ import (
 	"fmt"
 	"hash"
 	"hash/crc32"
+	"maps"
 	"math"
 	"net"
 	"os"
 	"reflect"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
-	jwt "github.com/golang-jwt/jwt/v5"
 	"github.com/hashicorp/cronexpr"
-	"github.com/hashicorp/go-msgpack/codec"
+	"github.com/hashicorp/go-msgpack/v2/codec"
 	"github.com/hashicorp/go-multierror"
-	"github.com/hashicorp/go-set"
+	"github.com/hashicorp/go-set/v3"
 	"github.com/hashicorp/go-version"
 	"github.com/hashicorp/nomad/acl"
+	"github.com/hashicorp/nomad/client/lib/idset"
+	"github.com/hashicorp/nomad/client/lib/numalib/hw"
 	"github.com/hashicorp/nomad/command/agent/host"
 	"github.com/hashicorp/nomad/command/agent/pprof"
 	"github.com/hashicorp/nomad/helper"
@@ -42,15 +45,12 @@ import (
 	"github.com/hashicorp/nomad/helper/escapingfs"
 	"github.com/hashicorp/nomad/helper/pointer"
 	"github.com/hashicorp/nomad/helper/uuid"
-	"github.com/hashicorp/nomad/lib/cpuset"
 	"github.com/hashicorp/nomad/lib/kheap"
 	psstructs "github.com/hashicorp/nomad/plugins/shared/structs"
 	"github.com/miekg/dns"
 	"github.com/mitchellh/copystructure"
 	"github.com/ryanuber/go-glob"
 	"golang.org/x/crypto/blake2b"
-	"golang.org/x/exp/maps"
-	"golang.org/x/exp/slices"
 )
 
 var (
@@ -117,8 +117,8 @@ const (
 	ServiceRegistrationDeleteByIDRequestType     MessageType = 48
 	ServiceRegistrationDeleteByNodeIDRequestType MessageType = 49
 	VarApplyStateRequestType                     MessageType = 50
-	RootKeyMetaUpsertRequestType                 MessageType = 51
-	RootKeyMetaDeleteRequestType                 MessageType = 52
+	RootKeyMetaUpsertRequestType                 MessageType = 51 // DEPRECATED
+	WrappedRootKeysDeleteRequestType             MessageType = 52
 	ACLRolesUpsertRequestType                    MessageType = 53
 	ACLRolesDeleteByIDRequestType                MessageType = 54
 	ACLAuthMethodsUpsertRequestType              MessageType = 55
@@ -127,13 +127,27 @@ const (
 	ACLBindingRulesDeleteRequestType             MessageType = 58
 	NodePoolUpsertRequestType                    MessageType = 59
 	NodePoolDeleteRequestType                    MessageType = 60
+	JobVersionTagRequestType                     MessageType = 61
+	WrappedRootKeysUpsertRequestType             MessageType = 62
+	NamespaceUpsertRequestType                   MessageType = 64
+	NamespaceDeleteRequestType                   MessageType = 65
 
-	// Namespace types were moved from enterprise and therefore start at 64
-	NamespaceUpsertRequestType MessageType = 64
-	NamespaceDeleteRequestType MessageType = 65
+	// MessageTypes 66-74 are in Nomad Enterprise
+	HostVolumeRegisterRequestType             MessageType = 75
+	HostVolumeDeleteRequestType               MessageType = 76
+	TaskGroupHostVolumeClaimDeleteRequestType MessageType = 77
+
+	// NOTE: MessageTypes are shared between CE and ENT. If you need to add a
+	// new type, check that ENT is not already using that value.
 )
 
 const (
+
+	// SystemInitializationType is used for messages that initialize parts of
+	// the system, such as the state store. These messages are not included in
+	// the event stream.
+	SystemInitializationType MessageType = 127
+
 	// IgnoreUnknownTypeFlag is set along with a MessageType
 	// to indicate that the message type can be safely ignored
 	// if it is not recognized. This is for future proofing, so
@@ -486,15 +500,24 @@ func (w WriteRequest) GetIdentity() *AuthenticatedIdentity {
 // ACLToken makes the original of the credential clear to RPC handlers, who may
 // have different behavior for internal vs external origins.
 type AuthenticatedIdentity struct {
-	// ACLToken authenticated. Claims will be nil if this is set.
+	// ACLToken authenticated. Claims and ClientID will be unset if this is set.
 	ACLToken *ACLToken
 
-	// Claims authenticated by workload identity. ACLToken will be nil if this is
-	// set.
+	// Claims authenticated by workload identity. ACLToken and ClientID will be
+	// unset if this is set.
 	Claims *IdentityClaims
 
+	// ClientID is the Nomad client node ID. ACLToken and Claims will be nil if
+	// this is set.
 	ClientID string
-	TLSName  string
+
+	// TLSName is the name of the TLS certificate, if any. Outside of the
+	// AuthenticateServerOnly and AuthenticateClientOnly methods, this should be
+	// used only to identify the request for metrics, not authorization
+	TLSName string
+
+	// RemoteIP is the name of the connection's IP address; this should be used
+	// only to identify the request for metrics, not authorization
 	RemoteIP net.IP
 }
 
@@ -516,7 +539,7 @@ func (ai *AuthenticatedIdentity) String() string {
 	if ai == nil {
 		return "unauthenticated"
 	}
-	if ai.ACLToken != nil {
+	if ai.ACLToken != nil && ai.ACLToken != AnonymousACLToken {
 		return "token:" + ai.ACLToken.AccessorID
 	}
 	if ai.Claims != nil {
@@ -576,6 +599,11 @@ type WriteMeta struct {
 type NodeRegisterRequest struct {
 	Node      *Node
 	NodeEvent *NodeEvent
+
+	// CreateNodePool is used to indicate that the node's node pool should be
+	// create along with the node registration if it doesn't exist.
+	CreateNodePool bool
+
 	WriteRequest
 }
 
@@ -638,6 +666,10 @@ type NodeUpdateDrainRequest struct {
 
 	// Meta is user-provided metadata relating to the drain operation
 	Meta map[string]string
+
+	// UpdatedBy represents the AuthenticatedIdentity of the request, so that we
+	// can record it in the LastDrain data without re-authenticating in the FSM.
+	UpdatedBy string
 
 	WriteRequest
 }
@@ -762,27 +794,10 @@ type JobDeregisterRequest struct {
 	// Eval is the evaluation to create that's associated with job deregister
 	Eval *Evaluation
 
-	WriteRequest
-}
-
-// JobBatchDeregisterRequest is used to batch deregister jobs and upsert
-// evaluations.
-type JobBatchDeregisterRequest struct {
-	// Jobs is the set of jobs to deregister
-	Jobs map[NamespacedID]*JobDeregisterOptions
-
-	// Evals is the set of evaluations to create.
-	Evals []*Evaluation
+	// SubmitTime is the time at which the job was requested to be stopped
+	SubmitTime int64
 
 	WriteRequest
-}
-
-// JobDeregisterOptions configures how a job is deregistered.
-type JobDeregisterOptions struct {
-	// Purge controls whether the deregister purges the job from the system or
-	// whether the job is just marked as stopped and will be removed by the
-	// garbage collector
-	Purge bool
 }
 
 // JobEvaluateRequest is used when we just need to re-evaluate a target job
@@ -851,8 +866,16 @@ type JobScaleRequest struct {
 	Message string
 	Error   bool
 	Meta    map[string]interface{}
+
 	// PolicyOverride is set when the user is attempting to override any policies
 	PolicyOverride bool
+
+	// If EnforceIndex is set then the job will only be scaled if the passed
+	// JobModifyIndex matches the current Jobs index. If the index is zero,
+	// EnforceIndex is ignored.
+	EnforceIndex   bool
+	JobModifyIndex uint64
+
 	WriteRequest
 }
 
@@ -936,12 +959,6 @@ type JobRevertRequest struct {
 	// Consul Connect enabled services. This field is only used to transfer the
 	// token and is not stored after the Job revert.
 	ConsulToken string
-
-	// VaultToken is the Vault token that proves the submitter of the job revert
-	// has access to any Vault policies specified in the targeted job version. This
-	// field is only used to transfer the token and is not stored after the Job
-	// revert.
-	VaultToken string
 
 	WriteRequest
 }
@@ -1175,6 +1192,26 @@ type AllocSignalRequest struct {
 	QueryOptions
 }
 
+// AllocPauseRequest is used to set the pause state of a task in an allocation.
+type AllocPauseRequest struct {
+	AllocID       string
+	Task          string
+	ScheduleState TaskScheduleState
+	QueryOptions
+}
+
+// AllocGetPauseStateRequest is used to get the pause state of a task in an allocation.
+type AllocGetPauseStateRequest struct {
+	AllocID string
+	Task    string
+	QueryOptions
+}
+
+// AllocGetPauseStateResponse contains the pause state of a task in an allocation.
+type AllocGetPauseStateResponse struct {
+	ScheduleState TaskScheduleState
+}
+
 // AllocsGetRequest is used to query a set of allocations
 type AllocsGetRequest struct {
 	AllocIDs []string
@@ -1225,21 +1262,6 @@ type ClusterMetadata struct {
 	CreateTime int64
 }
 
-// DeriveVaultTokenRequest is used to request wrapped Vault tokens for the
-// following tasks in the given allocation
-type DeriveVaultTokenRequest struct {
-	NodeID   string
-	SecretID string
-	AllocID  string
-	Tasks    []string
-	QueryOptions
-}
-
-// VaultAccessorsRequest is used to operate on a set of Vault accessors
-type VaultAccessorsRequest struct {
-	Accessors []*VaultAccessor
-}
-
 // VaultAccessor is a reference to a created Vault token on behalf of
 // an allocation's task.
 type VaultAccessor struct {
@@ -1251,18 +1273,6 @@ type VaultAccessor struct {
 
 	// Raft Indexes
 	CreateIndex uint64
-}
-
-// DeriveVaultTokenResponse returns the wrapped tokens for each requested task
-type DeriveVaultTokenResponse struct {
-	// Tasks is a mapping between the task name and the wrapped token
-	Tasks map[string]string
-
-	// Error stores any error that occurred. Errors are stored here so we can
-	// communicate whether it is retryable
-	Error *RecoverableError
-
-	QueryMeta
 }
 
 // GenericRequest is used to request where no
@@ -1342,6 +1352,9 @@ type DeploymentPromoteRequest struct {
 
 	// Groups is used to set the promotion status per task group
 	Groups []string
+
+	// PromotedAt is the timestamp stored as Unix nano
+	PromotedAt int64
 
 	WriteRequest
 }
@@ -1465,13 +1478,6 @@ type JobDeregisterResponse struct {
 	JobModifyIndex  uint64
 	VolumeEvalID    string
 	VolumeEvalIndex uint64
-	QueryMeta
-}
-
-// JobBatchDeregisterResponse is used to respond to a batch job deregistration
-type JobBatchDeregisterResponse struct {
-	// JobEvals maps the job to its created evaluation
-	JobEvals map[NamespacedID]string
 	QueryMeta
 }
 
@@ -1620,8 +1626,10 @@ type JobListResponse struct {
 
 // JobVersionsRequest is used to get a jobs versions
 type JobVersionsRequest struct {
-	JobID string
-	Diffs bool
+	JobID       string
+	Diffs       bool
+	DiffVersion *uint64
+	DiffTagName string
 	QueryOptions
 }
 
@@ -1670,9 +1678,14 @@ type SingleAllocResponse struct {
 	QueryMeta
 }
 
-// AllocsGetResponse is used to return a set of allocations
+// AllocsGetResponse is used to return a set of allocations and their workload
+// identities.
 type AllocsGetResponse struct {
 	Allocs []*Allocation
+
+	// SignedIdentities are the alternate workload identities for the Allocs.
+	SignedIdentities []SignedWorkloadIdentity
+
 	QueryMeta
 }
 
@@ -2131,7 +2144,7 @@ type Node struct {
 	StatusDescription string
 
 	// StatusUpdatedAt is the time stamp at which the state of the node was
-	// updated
+	// updated, stored as Unix (no nano seconds!)
 	StatusUpdatedAt int64
 
 	// Events is the most recent set of events generated for the node,
@@ -2213,6 +2226,13 @@ func (n *Node) Canonicalize() {
 		n.SchedulingEligibility = NodeSchedulingEligible
 	}
 
+	// COMPAT remove in 1.10+
+	// In v1.7 we introduce Topology into the NodeResources struct which the client
+	// will fingerprint. Since the upgrade path must cover servers that get upgraded
+	// before clients which will send the old struct, we synthesize a pseudo topology
+	// given the old struct data.
+	n.NodeResources.Compatibility()
+
 	// COMPAT remove in 1.0
 	// In v0.12.0 we introduced a separate node specific network resource struct
 	// so we need to covert any pre 0.12 clients to the correct struct
@@ -2283,69 +2303,25 @@ func (n *Node) TerminalStatus() bool {
 	}
 }
 
-// ComparableReservedResources returns the reserved resouces on the node
-// handling upgrade paths. Reserved networks must be handled separately. After
-// 0.11 calls to this should be replaced with:
-// node.ReservedResources.Comparable()
-//
-// COMPAT(0.11): Remove in 0.11
-func (n *Node) ComparableReservedResources() *ComparableResources {
-	// See if we can no-op
-	if n.Reserved == nil && n.ReservedResources == nil {
-		return nil
-	}
-
-	// Node already has 0.9+ behavior
-	if n.ReservedResources != nil {
-		return n.ReservedResources.Comparable()
-	}
-
-	// Upgrade path
-	return &ComparableResources{
-		Flattened: AllocatedTaskResources{
-			Cpu: AllocatedCpuResources{
-				CpuShares: int64(n.Reserved.CPU),
-			},
-			Memory: AllocatedMemoryResources{
-				MemoryMB: int64(n.Reserved.MemoryMB),
-			},
-		},
-		Shared: AllocatedSharedResources{
-			DiskMB: int64(n.Reserved.DiskMB),
-		},
-	}
-}
-
-// ComparableResources returns the resouces on the node
-// handling upgrade paths. Networking must be handled separately. After 0.11
-// calls to this should be replaced with: node.NodeResources.Comparable()
-//
-// // COMPAT(0.11): Remove in 0.11
-func (n *Node) ComparableResources() *ComparableResources {
-	// Node already has 0.9+ behavior
-	if n.NodeResources != nil {
-		return n.NodeResources.Comparable()
-	}
-
-	// Upgrade path
-	return &ComparableResources{
-		Flattened: AllocatedTaskResources{
-			Cpu: AllocatedCpuResources{
-				CpuShares: int64(n.Resources.CPU),
-			},
-			Memory: AllocatedMemoryResources{
-				MemoryMB: int64(n.Resources.MemoryMB),
-			},
-		},
-		Shared: AllocatedSharedResources{
-			DiskMB: int64(n.Resources.DiskMB),
-		},
-	}
-}
-
 func (n *Node) IsInAnyDC(datacenters []string) bool {
 	for _, dc := range datacenters {
 		if glob.Glob(dc, n.Datacenter) {
+			return true
+		}
+	}
+	return false
+}
+
+// IsInPool returns true if the node is in the pool argument or if the pool
+// argument is the special "all" pool
+func (n *Node) IsInPool(pool string) bool {
+	return pool == NodePoolAll || n.NodePool == pool
+}
+
+// HasEvent returns true if the node has the given message in its events list.
+func (n *Node) HasEvent(msg string) bool {
+	for _, ev := range n.Events {
+		if ev.Message == msg {
 			return true
 		}
 	}
@@ -2434,6 +2410,8 @@ type Resources struct {
 	IOPS        int // COMPAT(0.10): Only being used to issue warnings
 	Networks    Networks
 	Devices     ResourceDevices
+	NUMA        *NUMA
+	SecretsMB   int
 }
 
 const (
@@ -2470,6 +2448,12 @@ func (r *Resources) DiskInBytes() int64 {
 	return int64(r.DiskMB * BytesInMegabyte)
 }
 
+const (
+	// memoryNoLimit is a sentinel value indicating there is no upper hard
+	// memory limit
+	memoryNoLimit = -1
+)
+
 func (r *Resources) Validate() error {
 	var mErr multierror.Error
 
@@ -2486,14 +2470,40 @@ func (r *Resources) Validate() error {
 		mErr.Errors = append(mErr.Errors, errors.New("Task can't ask for disk resources, they have to be specified at the task group level."))
 	}
 
+	// Ensure devices are valid
+	devices := set.New[string](len(r.Devices))
 	for i, d := range r.Devices {
 		if err := d.Validate(); err != nil {
 			mErr.Errors = append(mErr.Errors, fmt.Errorf("device %d failed validation: %v", i+1, err))
 		}
+		devices.Insert(d.Name)
 	}
 
-	if r.MemoryMaxMB != 0 && r.MemoryMaxMB < r.MemoryMB {
+	// Ensure each numa bound device matches a device requested for task
+	if r.NUMA != nil {
+		for _, numaDevice := range r.NUMA.Devices {
+			if !devices.Contains(numaDevice) {
+				mErr.Errors = append(mErr.Errors, fmt.Errorf("numa device %q not requested as task resource", numaDevice))
+			}
+		}
+	}
+
+	// Ensure the numa block is valid
+	if err := r.NUMA.Validate(); err != nil {
+		mErr.Errors = append(mErr.Errors, err)
+	}
+
+	// Ensure memory_max is greater than memory, unless it is set to 0 or -1 which
+	// are both sentinel values
+	if (r.MemoryMaxMB != 0 && r.MemoryMaxMB != memoryNoLimit) && r.MemoryMaxMB < r.MemoryMB {
 		mErr.Errors = append(mErr.Errors, fmt.Errorf("MemoryMaxMB value (%d) should be larger than MemoryMB value (%d)", r.MemoryMaxMB, r.MemoryMB))
+	}
+
+	if r.SecretsMB > r.MemoryMB {
+		mErr.Errors = append(mErr.Errors, fmt.Errorf("SecretsMB value (%d) cannot be larger than MemoryMB value (%d)", r.SecretsMB, r.MemoryMB))
+	}
+	if r.SecretsMB < 0 {
+		mErr.Errors = append(mErr.Errors, fmt.Errorf("SecretsMB value (%d) cannot be negative", r.SecretsMB))
 	}
 
 	return mErr.ErrorOrNil()
@@ -2523,6 +2533,9 @@ func (r *Resources) Merge(other *Resources) {
 	if len(other.Devices) != 0 {
 		r.Devices = other.Devices
 	}
+	if other.SecretsMB != 0 {
+		r.SecretsMB = other.SecretsMB
+	}
 }
 
 // Equal Resources.
@@ -2542,13 +2555,28 @@ func (r *Resources) Equal(o *Resources) bool {
 		r.DiskMB == o.DiskMB &&
 		r.IOPS == o.IOPS &&
 		r.Networks.Equal(&o.Networks) &&
-		r.Devices.Equal(&o.Devices)
+		r.Devices.Equal(&o.Devices) &&
+		r.SecretsMB == o.SecretsMB
 }
 
 // ResourceDevices are part of Resources.
 //
 // COMPAT(0.10): Remove in 0.10.
 type ResourceDevices []*RequestedDevice
+
+// Copy ResourceDevices
+//
+// COMPAT(0.10): Remove in 0.10.
+func (d ResourceDevices) Copy() ResourceDevices {
+	if d == nil {
+		return nil
+	}
+	c := make(ResourceDevices, len(d))
+	for i, device := range d {
+		c[i] = device.Copy()
+	}
+	return c
+}
 
 // Equal ResourceDevices as set keyed by Name.
 //
@@ -2592,6 +2620,8 @@ func (r *Resources) Canonicalize() {
 	for _, n := range r.Networks {
 		n.Canonicalize()
 	}
+
+	r.NUMA.Canonicalize()
 }
 
 // MeetsMinResources returns an error if the resources specified are less than
@@ -2615,22 +2645,18 @@ func (r *Resources) Copy() *Resources {
 	if r == nil {
 		return nil
 	}
-	newR := new(Resources)
-	*newR = *r
-
-	// Copy the network objects
-	newR.Networks = r.Networks.Copy()
-
-	// Copy the devices
-	if r.Devices != nil {
-		n := len(r.Devices)
-		newR.Devices = make([]*RequestedDevice, n)
-		for i := 0; i < n; i++ {
-			newR.Devices[i] = r.Devices[i].Copy()
-		}
+	return &Resources{
+		CPU:         r.CPU,
+		Cores:       r.Cores,
+		MemoryMB:    r.MemoryMB,
+		MemoryMaxMB: r.MemoryMaxMB,
+		DiskMB:      r.DiskMB,
+		IOPS:        r.IOPS,
+		Networks:    r.Networks.Copy(),
+		Devices:     r.Devices.Copy(),
+		NUMA:        r.NUMA.Copy(),
+		SecretsMB:   r.SecretsMB,
 	}
-
-	return newR
 }
 
 // NetIndex finds the matching net index using device name
@@ -2649,12 +2675,14 @@ func (r *Resources) Add(delta *Resources) {
 
 	r.CPU += delta.CPU
 	r.MemoryMB += delta.MemoryMB
+	r.Cores += delta.Cores
 	if delta.MemoryMaxMB > 0 {
 		r.MemoryMaxMB += delta.MemoryMaxMB
 	} else {
 		r.MemoryMaxMB += delta.MemoryMB
 	}
 	r.DiskMB += delta.DiskMB
+	r.SecretsMB += delta.SecretsMB
 
 	for _, n := range delta.Networks {
 		// Find the matching interface by IP or CIDR
@@ -2664,6 +2692,21 @@ func (r *Resources) Add(delta *Resources) {
 		} else {
 			r.Networks[idx].Add(n)
 		}
+	}
+
+	if r.Devices == nil && delta.Devices != nil {
+		r.Devices = make(ResourceDevices, 0)
+	}
+	for _, dd := range delta.Devices {
+		idx := slices.IndexFunc(r.Devices, func(d *RequestedDevice) bool { return d.Name == dd.Name })
+
+		// means it's not found
+		if idx < 0 {
+			r.Devices = append(r.Devices, dd)
+			continue
+		}
+
+		r.Devices[idx].Count += dd.Count
 	}
 }
 
@@ -2722,6 +2765,14 @@ const (
 	NodeNetworkAF_IPv6 NodeNetworkAF = "ipv6"
 )
 
+// Validate validates that NodeNetworkAF has a legal value.
+func (n NodeNetworkAF) Validate() error {
+	if n == "" || n == NodeNetworkAF_IPv4 || n == NodeNetworkAF_IPv6 {
+		return nil
+	}
+	return fmt.Errorf(`network address family must be one of: "", %q, %q`, NodeNetworkAF_IPv4, NodeNetworkAF_IPv6)
+}
+
 type NodeNetworkAddress struct {
 	Family        NodeNetworkAF
 	Alias         string
@@ -2731,18 +2782,23 @@ type NodeNetworkAddress struct {
 }
 
 type AllocatedPortMapping struct {
-	Label  string
-	Value  int
-	To     int
-	HostIP string
+	// msgpack omit empty fields during serialization
+	_struct bool `codec:",omitempty"` // nolint: structcheck
+
+	Label           string
+	Value           int
+	To              int
+	HostIP          string
+	IgnoreCollision bool
 }
 
 func (m *AllocatedPortMapping) Copy() *AllocatedPortMapping {
 	return &AllocatedPortMapping{
-		Label:  m.Label,
-		Value:  m.Value,
-		To:     m.To,
-		HostIP: m.HostIP,
+		Label:           m.Label,
+		Value:           m.Value,
+		To:              m.To,
+		HostIP:          m.HostIP,
+		IgnoreCollision: m.IgnoreCollision,
 	}
 }
 
@@ -2758,6 +2814,8 @@ func (m *AllocatedPortMapping) Equal(o *AllocatedPortMapping) bool {
 	case m.To != o.To:
 		return false
 	case m.HostIP != o.HostIP:
+		return false
+	case m.IgnoreCollision != o.IgnoreCollision:
 		return false
 	}
 	return true
@@ -2782,6 +2840,9 @@ func (p AllocatedPorts) Get(label string) (AllocatedPortMapping, bool) {
 }
 
 type Port struct {
+	// msgpack omit empty fields during serialization
+	_struct bool `codec:",omitempty"` // nolint: structcheck
+
 	// Label is the key for HCL port blocks: port "foo" {}
 	Label string
 
@@ -2798,6 +2859,11 @@ type Port struct {
 	// to. Jobs with a HostNetwork set can only be placed on nodes with
 	// that host network available.
 	HostNetwork string
+
+	// IgnoreCollision ignores port collisions, so the port can be used more
+	// than one time on a single network, for tasks that support SO_REUSEPORT
+	// Should be used only with static ports.
+	IgnoreCollision bool
 }
 
 type DNSConfig struct {
@@ -2838,12 +2904,15 @@ func (d *DNSConfig) IsZero() bool {
 	if d == nil {
 		return true
 	}
-	return len(d.Options) == 0 || len(d.Searches) == 0 || len(d.Servers) == 0
+	return len(d.Options) == 0 && len(d.Searches) == 0 && len(d.Servers) == 0
 }
 
 // NetworkResource is used to represent available network
 // resources
 type NetworkResource struct {
+	// msgpack omit empty fields during serialization
+	_struct bool `codec:",omitempty"` // nolint: structcheck
+
 	Mode          string     // Mode of the network
 	Device        string     // Name of the device
 	CIDR          string     // CIDR block of addresses
@@ -2853,6 +2922,7 @@ type NetworkResource struct {
 	DNS           *DNSConfig // DNS Configuration
 	ReservedPorts []Port     // Host Reserved ports
 	DynamicPorts  []Port     // Host Dynamically assigned ports
+	CNI           *CNIConfig // CNIConfig Configuration
 }
 
 func (n *NetworkResource) Hash() uint32 {
@@ -2942,6 +3012,11 @@ func (n *NetworkResource) PortLabels() map[string]int {
 	return labelValues
 }
 
+func (n *NetworkResource) IsIPv6() bool {
+	ip := net.ParseIP(n.IP)
+	return ip != nil && ip.To4() == nil
+}
+
 // Networks defined for a task on the Resources struct.
 type Networks []*NetworkResource
 
@@ -2963,10 +3038,11 @@ func (ns Networks) Port(label string) AllocatedPortMapping {
 		for _, p := range n.ReservedPorts {
 			if p.Label == label {
 				return AllocatedPortMapping{
-					Label:  label,
-					Value:  p.Value,
-					To:     p.To,
-					HostIP: n.IP,
+					Label:           label,
+					Value:           p.Value,
+					To:              p.To,
+					HostIP:          n.IP,
+					IgnoreCollision: p.IgnoreCollision,
 				}
 			}
 		}
@@ -2993,6 +3069,13 @@ func (ns Networks) NetIndex(n *NetworkResource) int {
 	return -1
 }
 
+// Modes returns the set of network modes used by our NetworkResource blocks.
+func (ns Networks) Modes() *set.Set[string] {
+	return set.FromFunc(ns, func(nr *NetworkResource) string {
+		return nr.Mode
+	})
+}
+
 // RequestedDevice is used to request a device for a task.
 type RequestedDevice struct {
 	// Name is the request name. The possible values are as follows:
@@ -3016,6 +3099,10 @@ type RequestedDevice struct {
 	// Affinities are a set of affinities to apply when selecting the device
 	// to use.
 	Affinities Affinities
+}
+
+func (r *RequestedDevice) String() string {
+	return r.Name
 }
 
 func (r *RequestedDevice) Equal(o *RequestedDevice) bool {
@@ -3103,10 +3190,15 @@ func (r *RequestedDevice) Validate() error {
 
 // NodeResources is used to define the resources available on a client node.
 type NodeResources struct {
-	Cpu     NodeCpuResources
-	Memory  NodeMemoryResources
-	Disk    NodeDiskResources
-	Devices []*NodeDeviceResource
+	// Do not read from this value except for compatibility (i.e. serialization).
+	//
+	// Deprecated; use NodeProcessorResources instead.
+	Cpu LegacyNodeCpuResources
+
+	Processors NodeProcessorResources
+	Memory     NodeMemoryResources
+	Disk       NodeDiskResources
+	Devices    []*NodeDeviceResource
 
 	// NodeNetworks was added in Nomad 0.12 to support multiple interfaces.
 	// It is the superset of host_networks, fingerprinted networks, and the
@@ -3131,7 +3223,7 @@ func (n *NodeResources) Copy() *NodeResources {
 
 	newN := new(NodeResources)
 	*newN = *n
-	newN.Cpu = n.Cpu.Copy()
+	newN.Processors = n.Processors.Copy()
 	newN.Networks = n.Networks.Copy()
 
 	if n.NodeNetworks != nil {
@@ -3150,6 +3242,10 @@ func (n *NodeResources) Copy() *NodeResources {
 		}
 	}
 
+	// COMPAT remove in 1.10+
+	// apply compatibility fixups covering node topology
+	newN.Compatibility()
+
 	return newN
 }
 
@@ -3160,11 +3256,16 @@ func (n *NodeResources) Comparable() *ComparableResources {
 		return nil
 	}
 
+	usableCores := n.Processors.Topology.UsableCores().Slice()
+	reservableCores := helper.ConvertSlice(usableCores, func(id hw.CoreID) uint16 {
+		return uint16(id)
+	})
+
 	c := &ComparableResources{
 		Flattened: AllocatedTaskResources{
 			Cpu: AllocatedCpuResources{
-				CpuShares:     n.Cpu.CpuShares,
-				ReservedCores: n.Cpu.ReservableCpuCores,
+				CpuShares:     int64(n.Processors.Topology.TotalCompute()),
+				ReservedCores: reservableCores,
 			},
 			Memory: AllocatedMemoryResources{
 				MemoryMB: n.Memory.MemoryMB,
@@ -3183,7 +3284,7 @@ func (n *NodeResources) Merge(o *NodeResources) {
 		return
 	}
 
-	n.Cpu.Merge(&o.Cpu)
+	n.Processors.Merge(&o.Processors)
 	n.Memory.Merge(&o.Memory)
 	n.Disk.Merge(&o.Disk)
 
@@ -3204,6 +3305,10 @@ func (n *NodeResources) Merge(o *NodeResources) {
 			}
 		}
 	}
+
+	// COMPAT remove in 1.10+
+	// apply compatibility fixups covering node topology
+	n.Compatibility()
 }
 
 func lookupNetworkByDevice(nets []*NodeNetworkResource, name string) (int, *NodeNetworkResource) {
@@ -3224,7 +3329,7 @@ func (n *NodeResources) Equal(o *NodeResources) bool {
 		return false
 	}
 
-	if !n.Cpu.Equal(&o.Cpu) {
+	if !n.Processors.Equal(&o.Processors) {
 		return false
 	}
 	if !n.Memory.Equal(&o.Memory) {
@@ -3307,82 +3412,6 @@ func NodeNetworksEquals(n1, n2 []*NodeNetworkResource) bool {
 
 	return true
 
-}
-
-// NodeCpuResources captures the CPU resources of the node.
-type NodeCpuResources struct {
-	// CpuShares is the CPU shares available. This is calculated by number of
-	// cores multiplied by the core frequency.
-	CpuShares int64
-
-	// TotalCpuCores is the total number of cores on the machine. This includes cores not in
-	// the agent's cpuset if on a linux platform
-	TotalCpuCores uint16
-
-	// ReservableCpuCores is the set of cpus which are available to be reserved on the Node.
-	// This value is currently only reported on Linux platforms which support cgroups and is
-	// discovered by inspecting the cpuset of the agent's cgroup.
-	ReservableCpuCores []uint16
-}
-
-func (n NodeCpuResources) Copy() NodeCpuResources {
-	newN := n
-	if n.ReservableCpuCores != nil {
-		newN.ReservableCpuCores = make([]uint16, len(n.ReservableCpuCores))
-		copy(newN.ReservableCpuCores, n.ReservableCpuCores)
-	}
-
-	return newN
-}
-
-func (n *NodeCpuResources) Merge(o *NodeCpuResources) {
-	if o == nil {
-		return
-	}
-
-	if o.CpuShares != 0 {
-		n.CpuShares = o.CpuShares
-	}
-
-	if o.TotalCpuCores != 0 {
-		n.TotalCpuCores = o.TotalCpuCores
-	}
-
-	if len(o.ReservableCpuCores) != 0 {
-		n.ReservableCpuCores = o.ReservableCpuCores
-	}
-}
-
-func (n *NodeCpuResources) Equal(o *NodeCpuResources) bool {
-	if o == nil && n == nil {
-		return true
-	} else if o == nil {
-		return false
-	} else if n == nil {
-		return false
-	}
-
-	if n.CpuShares != o.CpuShares {
-		return false
-	}
-
-	if n.TotalCpuCores != o.TotalCpuCores {
-		return false
-	}
-
-	if len(n.ReservableCpuCores) != len(o.ReservableCpuCores) {
-		return false
-	}
-	for i := range n.ReservableCpuCores {
-		if n.ReservableCpuCores[i] != o.ReservableCpuCores[i] {
-			return false
-		}
-	}
-	return true
-}
-
-func (n *NodeCpuResources) SharesPerCore() int64 {
-	return n.CpuShares / int64(n.TotalCpuCores)
 }
 
 // NodeMemoryResources captures the memory resources of the node
@@ -3751,6 +3780,17 @@ type AllocatedResources struct {
 	Shared AllocatedSharedResources
 }
 
+// UsesCores returns true if any of the tasks in the allocation make use
+// of reserved cpu cores.
+func (a *AllocatedResources) UsesCores() bool {
+	for _, taskRes := range a.Tasks {
+		if len(taskRes.Cpu.ReservedCores) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 func (a *AllocatedResources) Copy() *AllocatedResources {
 	if a == nil {
 		return nil
@@ -3788,31 +3828,45 @@ func (a *AllocatedResources) Comparable() *ComparableResources {
 		Shared: a.Shared,
 	}
 
-	prestartSidecarTasks := &AllocatedTaskResources{}
-	prestartEphemeralTasks := &AllocatedTaskResources{}
-	main := &AllocatedTaskResources{}
-	poststopTasks := &AllocatedTaskResources{}
+	// The lifecycle in which a task could run
+	prestartLifecycle := &AllocatedTaskResources{}
+	mainLifecycle := &AllocatedTaskResources{}
+	stopLifecycle := &AllocatedTaskResources{}
 
-	for taskName, r := range a.Tasks {
-		lc := a.TaskLifecycles[taskName]
-		if lc == nil {
-			main.Add(r)
-		} else if lc.Hook == TaskLifecycleHookPrestart {
-			if lc.Sidecar {
-				prestartSidecarTasks.Add(r)
+	for taskName, taskResources := range a.Tasks {
+		taskLifecycle := a.TaskLifecycles[taskName]
+		fungibleTaskResources := taskResources.Copy()
+
+		// Reserved cores (and their respective bandwidth) are not fungible,
+		// hence we should always include it as part of the Flattened resources.
+		if len(fungibleTaskResources.Cpu.ReservedCores) > 0 {
+			c.Flattened.Cpu.Add(&fungibleTaskResources.Cpu)
+			fungibleTaskResources.Cpu = AllocatedCpuResources{}
+		}
+
+		if taskLifecycle == nil {
+			mainLifecycle.Add(fungibleTaskResources)
+		} else if taskLifecycle.Hook == TaskLifecycleHookPrestart {
+			if taskLifecycle.Sidecar {
+				// These tasks span both the prestart and main lifecycle
+				prestartLifecycle.Add(fungibleTaskResources)
+				mainLifecycle.Add(fungibleTaskResources)
 			} else {
-				prestartEphemeralTasks.Add(r)
+				prestartLifecycle.Add(fungibleTaskResources)
 			}
-		} else if lc.Hook == TaskLifecycleHookPoststop {
-			poststopTasks.Add(r)
+		} else if taskLifecycle.Hook == TaskLifecycleHookPoststart {
+			mainLifecycle.Add(fungibleTaskResources)
+		} else if taskLifecycle.Hook == TaskLifecycleHookPoststop {
+			stopLifecycle.Add(fungibleTaskResources)
 		}
 	}
 
-	// update this loop to account for lifecycle hook
-	prestartEphemeralTasks.Max(main)
-	prestartEphemeralTasks.Max(poststopTasks)
-	prestartSidecarTasks.Add(prestartEphemeralTasks)
-	c.Flattened.Add(prestartSidecarTasks)
+	// Update the main lifecycle to reflect the largest fungible resource set
+	mainLifecycle.Max(prestartLifecycle)
+	mainLifecycle.Max(stopLifecycle)
+
+	// Add the fungible resources
+	c.Flattened.Add(mainLifecycle)
 
 	// Add network resources that are at the task group level
 	for _, network := range a.Shared.Networks {
@@ -3824,11 +3878,13 @@ func (a *AllocatedResources) Comparable() *ComparableResources {
 	return c
 }
 
-// OldTaskResources returns the pre-0.9.0 map of task resources
+// OldTaskResources returns the pre-0.9.0 map of task resources. This
+// functionality is still used within the scheduling code.
 func (a *AllocatedResources) OldTaskResources() map[string]*Resources {
 	m := make(map[string]*Resources, len(a.Tasks))
 	for name, res := range a.Tasks {
 		m[name] = &Resources{
+			Cores:       len(res.Cpu.ReservedCores),
 			CPU:         int(res.Cpu.CpuShares),
 			MemoryMB:    int(res.Memory.MemoryMB),
 			MemoryMaxMB: int(res.Memory.MemoryMaxMB),
@@ -4050,9 +4106,14 @@ func (a *AllocatedCpuResources) Add(delta *AllocatedCpuResources) {
 		return
 	}
 
+	// add cpu bandwidth
 	a.CpuShares += delta.CpuShares
 
-	a.ReservedCores = cpuset.New(a.ReservedCores...).Union(cpuset.New(delta.ReservedCores...)).ToSlice()
+	// add cpu cores
+	cores := idset.From[uint16](a.ReservedCores)
+	deltaCores := idset.From[uint16](delta.ReservedCores)
+	cores.InsertSet(deltaCores)
+	a.ReservedCores = cores.Slice()
 }
 
 func (a *AllocatedCpuResources) Subtract(delta *AllocatedCpuResources) {
@@ -4060,8 +4121,14 @@ func (a *AllocatedCpuResources) Subtract(delta *AllocatedCpuResources) {
 		return
 	}
 
+	// remove cpu bandwidth
 	a.CpuShares -= delta.CpuShares
-	a.ReservedCores = cpuset.New(a.ReservedCores...).Difference(cpuset.New(delta.ReservedCores...)).ToSlice()
+
+	// remove cpu cores
+	cores := idset.From[uint16](a.ReservedCores)
+	deltaCores := idset.From[uint16](delta.ReservedCores)
+	cores.RemoveSet(deltaCores)
+	a.ReservedCores = cores.Slice()
 }
 
 func (a *AllocatedCpuResources) Max(other *AllocatedCpuResources) {
@@ -4227,12 +4294,16 @@ func (c *ComparableResources) Superset(other *ComparableResources) (bool, string
 		return false, "cpu"
 	}
 
-	if len(c.Flattened.Cpu.ReservedCores) > 0 && !cpuset.New(c.Flattened.Cpu.ReservedCores...).IsSupersetOf(cpuset.New(other.Flattened.Cpu.ReservedCores...)) {
+	cores := idset.From[uint16](c.Flattened.Cpu.ReservedCores)
+	otherCores := idset.From[uint16](other.Flattened.Cpu.ReservedCores)
+	if len(c.Flattened.Cpu.ReservedCores) > 0 && !cores.Superset(otherCores) {
 		return false, "cores"
 	}
+
 	if c.Flattened.Memory.MemoryMB < other.Flattened.Memory.MemoryMB {
 		return false, "memory"
 	}
+
 	if c.Shared.DiskMB < other.Shared.DiskMB {
 		return false, "disk"
 	}
@@ -4278,9 +4349,9 @@ const (
 	// for the system to remain healthy.
 	CoreJobPriority = math.MaxInt16
 
-	// JobTrackedVersions is the number of historic job versions that are
+	// JobDefaultTrackedVersions is the number of historic job versions that are
 	// kept.
-	JobTrackedVersions = 6
+	JobDefaultTrackedVersions = 6
 
 	// JobTrackedScalingEvents is the number of scaling events that are
 	// kept for a single task group.
@@ -4294,6 +4365,7 @@ type JobSubmission struct {
 	Source string
 
 	// Format indicates whether the original job was hcl1, hcl2, or json.
+	// hcl1 format has been removed and can no longer be parsed.
 	Format string
 
 	// VariableFlags contain the CLI "-var" flag arguments as submitted with the
@@ -4394,7 +4466,12 @@ type Job struct {
 	// Datacenters contains all the datacenters this job is allowed to span
 	Datacenters []string
 
-	// NodePool specifies the node pool this job is allowed to run on
+	// NodePool specifies the node pool this job is allowed to run on.
+	//
+	// An empty value is allowed during job registration, in which case the
+	// namespace default node pool is used in Enterprise and the 'default' node
+	// pool in OSS. But a node pool must be set before the job is stored, so
+	// that will happen in the admission mutators.
 	NodePool string
 
 	// Constraints can be specified at a job level and apply to
@@ -4450,11 +4527,6 @@ type Job struct {
 	// ConsulNamespace is the Consul namespace
 	ConsulNamespace string
 
-	// VaultToken is the Vault token that proves the submitter of the job has
-	// access to the specified Vault policies. This field is only used to
-	// transfer the token and is not stored after Job submission.
-	VaultToken string
-
 	// VaultNamespace is the Vault namespace
 	VaultNamespace string
 
@@ -4480,14 +4552,91 @@ type Job struct {
 	// on each job register.
 	Version uint64
 
-	// SubmitTime is the time at which the job was submitted as a UnixNano in
-	// UTC
+	// SubmitTime is the time at which the job version was submitted as
+	// UnixNano in UTC
 	SubmitTime int64
 
 	// Raft Indexes
-	CreateIndex    uint64
-	ModifyIndex    uint64
+	CreateIndex uint64
+	// ModifyIndex is the index at which any state of the job last changed
+	ModifyIndex uint64
+	// JobModifyIndex is the index at which the job *specification* last changed
 	JobModifyIndex uint64
+
+	// Links and Description fields for the Web UI
+	UI *JobUIConfig
+
+	// Metadata related to a tagged Job Version (which itself is really a Job)
+	VersionTag *JobVersionTag
+}
+
+type JobVersionTag struct {
+	Name        string
+	Description string
+	TaggedTime  int64
+}
+
+type JobApplyTagRequest struct {
+	JobID   string
+	Name    string
+	Tag     *JobVersionTag
+	Version uint64
+	WriteRequest
+}
+
+type JobTagResponse struct {
+	Name        string
+	Description string
+	TaggedTime  int64
+	QueryMeta
+}
+
+func (tv *JobVersionTag) Copy() *JobVersionTag {
+	if tv == nil {
+		return nil
+	}
+	return &JobVersionTag{
+		Name:        tv.Name,
+		Description: tv.Description,
+		TaggedTime:  tv.TaggedTime,
+	}
+}
+
+type JobUIConfig struct {
+	Description string
+	Links       []*JobUILink
+}
+
+type JobUILink struct {
+	Label string
+	Url   string
+}
+
+func (j *JobUIConfig) Copy() *JobUIConfig {
+	if j == nil {
+		return nil
+	}
+	copy := new(JobUIConfig)
+	copy.Description = j.Description
+
+	if j.Links != nil {
+		links := make([]*JobUILink, len(j.Links))
+		for i, link := range j.Links {
+			links[i] = link.Copy()
+		}
+		copy.Links = links
+	}
+	return copy
+}
+
+func (l *JobUILink) Copy() *JobUILink {
+	if l == nil {
+		return nil
+	}
+	copy := new(JobUILink)
+	copy.Label = l.Label
+	copy.Url = l.Url
+	return copy
 }
 
 // NamespacedID returns the namespaced id useful for logging
@@ -4516,6 +4665,15 @@ func (j *Job) GetNamespace() string {
 	return j.Namespace
 }
 
+// GetIDforWorkloadIdentity is used when we want the job ID for identity; here we
+// always want the parent ID if there is one and then fallback to the ID
+func (j *Job) GetIDforWorkloadIdentity() string {
+	if j.ParentID != "" {
+		return j.ParentID
+	}
+	return j.ID
+}
+
 // GetCreateIndex implements the CreateIndexGetter interface, required for
 // pagination.
 func (j *Job) GetCreateIndex() uint64 {
@@ -4525,6 +4683,15 @@ func (j *Job) GetCreateIndex() uint64 {
 	return j.CreateIndex
 }
 
+// GetModifyIndex implements the ModifyIndexGetter interface, required for
+// pagination.
+func (j *Job) GetModifyIndex() uint64 {
+	if j == nil {
+		return 0
+	}
+	return j.ModifyIndex
+}
+
 // Canonicalize is used to canonicalize fields in the Job. This should be
 // called when registering a Job.
 func (j *Job) Canonicalize() {
@@ -4532,10 +4699,22 @@ func (j *Job) Canonicalize() {
 		return
 	}
 
-	// Ensure that an empty and nil map are treated the same to avoid scheduling
+	// Ensure that an empty and nil map or array are treated the same to avoid scheduling
 	// problems since we use reflect DeepEquals.
 	if len(j.Meta) == 0 {
 		j.Meta = nil
+	}
+
+	if len(j.Constraints) == 0 {
+		j.Constraints = nil
+	}
+
+	if len(j.Affinities) == 0 {
+		j.Affinities = nil
+	}
+
+	if len(j.Spreads) == 0 {
+		j.Spreads = nil
 	}
 
 	// Ensure the job is in a namespace.
@@ -4545,10 +4724,6 @@ func (j *Job) Canonicalize() {
 
 	if len(j.Datacenters) == 0 {
 		j.Datacenters = []string{"*"}
-	}
-
-	if j.NodePool == "" {
-		j.NodePool = NodePoolDefault
 	}
 
 	for _, tg := range j.TaskGroups {
@@ -4576,22 +4751,24 @@ func (j *Job) Copy() *Job {
 	}
 	nj := new(Job)
 	*nj = *j
-	nj.Datacenters = slices.Clone(nj.Datacenters)
-	nj.Constraints = CopySliceConstraints(nj.Constraints)
-	nj.Affinities = CopySliceAffinities(nj.Affinities)
-	nj.Multiregion = nj.Multiregion.Copy()
+	nj.Datacenters = slices.Clone(j.Datacenters)
+	nj.Constraints = CopySliceConstraints(j.Constraints)
+	nj.Affinities = CopySliceAffinities(j.Affinities)
+	nj.Multiregion = j.Multiregion.Copy()
+	nj.UI = j.UI.Copy()
+	nj.VersionTag = j.VersionTag.Copy()
 
 	if j.TaskGroups != nil {
-		tgs := make([]*TaskGroup, len(nj.TaskGroups))
-		for i, tg := range nj.TaskGroups {
+		tgs := make([]*TaskGroup, len(j.TaskGroups))
+		for i, tg := range j.TaskGroups {
 			tgs[i] = tg.Copy()
 		}
 		nj.TaskGroups = tgs
 	}
 
-	nj.Periodic = nj.Periodic.Copy()
-	nj.Meta = maps.Clone(nj.Meta)
-	nj.ParameterizedJob = nj.ParameterizedJob.Copy()
+	nj.Periodic = j.Periodic.Copy()
+	nj.Meta = maps.Clone(j.Meta)
+	nj.ParameterizedJob = j.ParameterizedJob.Copy()
 	return nj
 }
 
@@ -4614,6 +4791,7 @@ func (j *Job) Validate() error {
 	} else if strings.Contains(j.Name, "\000") {
 		mErr.Errors = append(mErr.Errors, errors.New("Job Name contains a null character"))
 	}
+
 	if j.Namespace == "" {
 		mErr.Errors = append(mErr.Errors, errors.New("Job must be in a namespace"))
 	}
@@ -4632,9 +4810,6 @@ func (j *Job) Validate() error {
 				mErr.Errors = append(mErr.Errors, errors.New("Job datacenter must be non-empty string"))
 			}
 		}
-	}
-	if j.NodePool == "" {
-		mErr.Errors = append(mErr.Errors, errors.New("Job must be in a node_pool"))
 	}
 
 	if len(j.TaskGroups) == 0 {
@@ -4672,6 +4847,19 @@ func (j *Job) Validate() error {
 		}
 	}
 
+	const MaxDescriptionCharacters = 1000
+	if j.UI != nil {
+		if len(j.UI.Description) > MaxDescriptionCharacters {
+			mErr.Errors = append(mErr.Errors, fmt.Errorf("UI description must be under 1000 characters, currently %d", len(j.UI.Description)))
+		}
+	}
+
+	if j.VersionTag != nil {
+		if len(j.VersionTag.Description) > MaxDescriptionCharacters {
+			mErr.Errors = append(mErr.Errors, fmt.Errorf("Tagged version description must be under 1000 characters, currently %d", len(j.VersionTag.Description)))
+		}
+	}
+
 	// Check for duplicate task groups
 	taskGroups := make(map[string]int)
 	for idx, tg := range j.TaskGroups {
@@ -4700,6 +4888,13 @@ func (j *Job) Validate() error {
 			mErr.Errors = append(mErr.Errors,
 				fmt.Errorf("Job task group %s has count %d. Count cannot exceed 1 with system scheduler",
 					tg.Name, tg.Count))
+		}
+
+		if tg.MaxClientDisconnect != nil &&
+			(tg.ReschedulePolicy != nil && tg.ReschedulePolicy.Attempts > 0) &&
+			tg.PreventRescheduleOnLost {
+			err := fmt.Errorf("max_client_disconnect and prevent_reschedule_on_lost cannot be enabled when rechedule.attempts > 0")
+			mErr.Errors = append(mErr.Errors, err)
 		}
 	}
 
@@ -4773,11 +4968,20 @@ func (j *Job) Warnings() error {
 		mErr.Errors = append(mErr.Errors, err)
 	}
 
+	// cron -> crons
+	if j.Periodic != nil && j.Periodic.Spec != "" {
+		err := fmt.Errorf("cron is deprecated and may be removed in a future release. Use crons instead")
+		mErr.Errors = append(mErr.Errors, err)
+	}
+
 	return mErr.ErrorOrNil()
 }
 
 // LookupTaskGroup finds a task group by name
 func (j *Job) LookupTaskGroup(name string) *TaskGroup {
+	if j == nil {
+		return nil
+	}
 	for _, tg := range j.TaskGroups {
 		if tg.Name == name {
 			return tg
@@ -4893,11 +5097,23 @@ func (j *Job) IsMultiregion() bool {
 	return j.Multiregion != nil && j.Multiregion.Regions != nil && len(j.Multiregion.Regions) > 0
 }
 
-// IsPlugin returns whether a job is implements a plugin (currently just CSI)
+// IsPlugin returns whether a job implements a plugin (currently just CSI)
 func (j *Job) IsPlugin() bool {
 	for _, tg := range j.TaskGroups {
 		for _, task := range tg.Tasks {
 			if task.CSIPluginConfig != nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// HasPlugin returns whether a job implements a specific plugin ID
+func (j *Job) HasPlugin(id string) bool {
+	for _, tg := range j.TaskGroups {
+		for _, task := range tg.Tasks {
+			if task.CSIPluginConfig != nil && task.CSIPluginConfig.ID == id {
 				return true
 			}
 		}
@@ -5341,6 +5557,13 @@ type Namespace struct {
 	// Capabilities is the set of capabilities allowed for this namespace
 	Capabilities *NamespaceCapabilities
 
+	// NodePoolConfiguration is the namespace configuration for handling node
+	// pools.
+	NodePoolConfiguration *NamespaceNodePoolConfiguration
+
+	VaultConfiguration  *NamespaceVaultConfiguration
+	ConsulConfiguration *NamespaceConsulConfiguration
+
 	// Meta is the set of metadata key/value pairs that attached to the namespace
 	Meta map[string]string
 
@@ -5356,8 +5579,32 @@ type Namespace struct {
 // NamespaceCapabilities represents a set of capabilities allowed for this
 // namespace, to be checked at job submission time.
 type NamespaceCapabilities struct {
-	EnabledTaskDrivers  []string
-	DisabledTaskDrivers []string
+	EnabledTaskDrivers   []string
+	DisabledTaskDrivers  []string
+	EnabledNetworkModes  []string
+	DisabledNetworkModes []string
+}
+
+// NamespaceNodePoolConfiguration stores configuration about node pools for a
+// namespace.
+type NamespaceNodePoolConfiguration struct {
+	// Default is the node pool used by jobs in this namespace that don't
+	// specify a node pool of their own.
+	Default string
+
+	// Allowed specifies the node pools that are allowed to be used by jobs in
+	// this namespace. By default, all node pools are allowed. If an empty list
+	// is provided only the namespace's default node pool is allowed. This field
+	// supports wildcard globbing through the use of `*` for multi-character
+	// matching. This field cannot be used with Denied.
+	Allowed []string
+
+	// Denied specifies the node pools that are not allowed to be used by jobs
+	// in this namespace. This field supports wildcard globbing through the use
+	// of `*` for multi-character matching. If specified, any node pool is
+	// allowed to be used, except for those that match any of these patterns.
+	// This field cannot be used with Allowed.
+	Denied []string
 }
 
 func (n *Namespace) Validate() error {
@@ -5371,6 +5618,36 @@ func (n *Namespace) Validate() error {
 	if len(n.Description) > maxNamespaceDescriptionLength {
 		err := fmt.Errorf("description longer than %d", maxNamespaceDescriptionLength)
 		mErr.Errors = append(mErr.Errors, err)
+	}
+
+	err := n.NodePoolConfiguration.Validate()
+	switch e := err.(type) {
+	case *multierror.Error:
+		for _, npErr := range e.Errors {
+			mErr.Errors = append(mErr.Errors, fmt.Errorf("invalid node pool configuration: %v", npErr))
+		}
+	case error:
+		mErr.Errors = append(mErr.Errors, fmt.Errorf("invalid node pool configuration: %v", e))
+	}
+
+	err = n.VaultConfiguration.Validate()
+	switch e := err.(type) {
+	case *multierror.Error:
+		for _, vErr := range e.Errors {
+			mErr.Errors = append(mErr.Errors, fmt.Errorf("invalid vault configuration: %v", vErr))
+		}
+	case error:
+		mErr.Errors = append(mErr.Errors, fmt.Errorf("invalid vault configuration: %v", e))
+	}
+
+	err = n.ConsulConfiguration.Validate()
+	switch e := err.(type) {
+	case *multierror.Error:
+		for _, cErr := range e.Errors {
+			mErr.Errors = append(mErr.Errors, fmt.Errorf("invalid consul configuration: %v", cErr))
+		}
+	case error:
+		mErr.Errors = append(mErr.Errors, fmt.Errorf("invalid consul configuration: %v", e))
 	}
 
 	return mErr.ErrorOrNil()
@@ -5394,6 +5671,41 @@ func (n *Namespace) SetHash() []byte {
 		}
 		for _, driver := range n.Capabilities.DisabledTaskDrivers {
 			_, _ = hash.Write([]byte(driver))
+		}
+		for _, mode := range n.Capabilities.EnabledNetworkModes {
+			_, _ = hash.Write([]byte(mode))
+		}
+		for _, mode := range n.Capabilities.DisabledNetworkModes {
+			_, _ = hash.Write([]byte(mode))
+		}
+	}
+	if n.NodePoolConfiguration != nil {
+		_, _ = hash.Write([]byte(n.NodePoolConfiguration.Default))
+		for _, pool := range n.NodePoolConfiguration.Allowed {
+			_, _ = hash.Write([]byte(pool))
+		}
+		for _, pool := range n.NodePoolConfiguration.Denied {
+			_, _ = hash.Write([]byte(pool))
+		}
+	}
+
+	if n.VaultConfiguration != nil {
+		_, _ = hash.Write([]byte(n.VaultConfiguration.Default))
+		for _, cluster := range n.VaultConfiguration.Allowed {
+			_, _ = hash.Write([]byte(cluster))
+		}
+		for _, cluster := range n.VaultConfiguration.Denied {
+			_, _ = hash.Write([]byte(cluster))
+		}
+	}
+
+	if n.ConsulConfiguration != nil {
+		_, _ = hash.Write([]byte(n.ConsulConfiguration.Default))
+		for _, cluster := range n.ConsulConfiguration.Allowed {
+			_, _ = hash.Write([]byte(cluster))
+		}
+		for _, cluster := range n.ConsulConfiguration.Denied {
+			_, _ = hash.Write([]byte(cluster))
 		}
 	}
 
@@ -5426,8 +5738,29 @@ func (n *Namespace) Copy() *Namespace {
 		*c = *n.Capabilities
 		c.EnabledTaskDrivers = slices.Clone(n.Capabilities.EnabledTaskDrivers)
 		c.DisabledTaskDrivers = slices.Clone(n.Capabilities.DisabledTaskDrivers)
+		c.EnabledNetworkModes = slices.Clone(n.Capabilities.EnabledNetworkModes)
+		c.DisabledNetworkModes = slices.Clone(n.Capabilities.DisabledNetworkModes)
 		nc.Capabilities = c
 	}
+	if n.NodePoolConfiguration != nil {
+		np := new(NamespaceNodePoolConfiguration)
+		*np = *n.NodePoolConfiguration
+		np.Allowed = slices.Clone(n.NodePoolConfiguration.Allowed)
+		np.Denied = slices.Clone(n.NodePoolConfiguration.Denied)
+	}
+	if n.VaultConfiguration != nil {
+		nv := new(NamespaceVaultConfiguration)
+		*nv = *n.VaultConfiguration
+		nv.Allowed = slices.Clone(n.VaultConfiguration.Allowed)
+		nv.Denied = slices.Clone(n.VaultConfiguration.Denied)
+	}
+	if n.ConsulConfiguration != nil {
+		nc := new(NamespaceConsulConfiguration)
+		*nc = *n.ConsulConfiguration
+		nc.Allowed = slices.Clone(n.ConsulConfiguration.Allowed)
+		nc.Denied = slices.Clone(n.ConsulConfiguration.Denied)
+	}
+
 	if n.Meta != nil {
 		nc.Meta = make(map[string]string, len(n.Meta))
 		for k, v := range n.Meta {
@@ -5503,6 +5836,10 @@ type PeriodicConfig struct {
 	// on the SpecType.
 	Spec string
 
+	// Specs specifies the intervals the job should be run as. It is parsed based
+	// on the SpecType.
+	Specs []string
+
 	// SpecType defines the format of the spec.
 	SpecType string
 
@@ -5535,7 +5872,10 @@ func (p *PeriodicConfig) Validate() error {
 	}
 
 	var mErr multierror.Error
-	if p.Spec == "" {
+	if p.Spec != "" && len(p.Specs) != 0 {
+		_ = multierror.Append(&mErr, fmt.Errorf("Only cron or crons may be used"))
+	}
+	if p.Spec == "" && len(p.Specs) == 0 {
 		_ = multierror.Append(&mErr, fmt.Errorf("Must specify a spec"))
 	}
 
@@ -5549,9 +5889,18 @@ func (p *PeriodicConfig) Validate() error {
 	switch p.SpecType {
 	case PeriodicSpecCron:
 		// Validate the cron spec
-		if _, err := cronexpr.Parse(p.Spec); err != nil {
-			_ = multierror.Append(&mErr, fmt.Errorf("Invalid cron spec %q: %v", p.Spec, err))
+		if p.Spec != "" {
+			if _, err := cronexpr.Parse(p.Spec); err != nil {
+				_ = multierror.Append(&mErr, fmt.Errorf("Invalid cron spec %q: %v", p.Spec, err))
+			}
 		}
+		// Validate the cron specs
+		for _, spec := range p.Specs {
+			if _, err := cronexpr.Parse(spec); err != nil {
+				_ = multierror.Append(&mErr, fmt.Errorf("Invalid cron spec %q: %v", spec, err))
+			}
+		}
+
 	case PeriodicSpecTest:
 		// No-op
 	default:
@@ -5573,15 +5922,18 @@ func (p *PeriodicConfig) Canonicalize() {
 
 // CronParseNext is a helper that parses the next time for the given expression
 // but captures any panic that may occur in the underlying library.
-func CronParseNext(e *cronexpr.Expression, fromTime time.Time, spec string) (t time.Time, err error) {
+func CronParseNext(fromTime time.Time, spec string) (t time.Time, err error) {
 	defer func() {
 		if recover() != nil {
 			t = time.Time{}
 			err = fmt.Errorf("failed parsing cron expression: %q", spec)
 		}
 	}()
-
-	return e.Next(fromTime), nil
+	exp, err := cronexpr.Parse(spec)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("failed parsing cron expression: %s: %v", spec, err)
+	}
+	return exp.Next(fromTime), nil
 }
 
 // Next returns the closest time instant matching the spec that is after the
@@ -5591,11 +5943,24 @@ func CronParseNext(e *cronexpr.Expression, fromTime time.Time, spec string) (t t
 func (p *PeriodicConfig) Next(fromTime time.Time) (time.Time, error) {
 	switch p.SpecType {
 	case PeriodicSpecCron:
-		e, err := cronexpr.Parse(p.Spec)
-		if err != nil {
-			return time.Time{}, fmt.Errorf("failed parsing cron expression: %q: %v", p.Spec, err)
+		// Single spec parsing
+		if p.Spec != "" {
+			return CronParseNext(fromTime, p.Spec)
 		}
-		return CronParseNext(e, fromTime, p.Spec)
+
+		// multiple specs parsing
+		var nextTime time.Time
+		for _, spec := range p.Specs {
+			t, err := CronParseNext(fromTime, spec)
+			if err != nil {
+				return time.Time{}, fmt.Errorf("failed parsing cron expression %s: %v", spec, err)
+			}
+			if nextTime.IsZero() || t.Before(nextTime) {
+				nextTime = t
+			}
+		}
+		return nextTime, nil
+
 	case PeriodicSpecTest:
 		split := strings.Split(p.Spec, ",")
 		if len(split) == 1 && split[0] == "" {
@@ -5790,16 +6155,18 @@ var (
 	// Canonicalize in api/tasks.go
 
 	DefaultServiceJobRestartPolicy = RestartPolicy{
-		Delay:    15 * time.Second,
-		Attempts: 2,
-		Interval: 30 * time.Minute,
-		Mode:     RestartPolicyModeFail,
+		Delay:           15 * time.Second,
+		Attempts:        2,
+		Interval:        30 * time.Minute,
+		Mode:            RestartPolicyModeFail,
+		RenderTemplates: false,
 	}
 	DefaultBatchJobRestartPolicy = RestartPolicy{
-		Delay:    15 * time.Second,
-		Attempts: 3,
-		Interval: 24 * time.Hour,
-		Mode:     RestartPolicyModeFail,
+		Delay:           15 * time.Second,
+		Attempts:        3,
+		Interval:        24 * time.Hour,
+		Mode:            RestartPolicyModeFail,
+		RenderTemplates: false,
 	}
 )
 
@@ -5852,6 +6219,21 @@ type JobScalingEvents struct {
 	ModifyIndex uint64
 }
 
+func (j *JobScalingEvents) Copy() *JobScalingEvents {
+	if j == nil {
+		return nil
+	}
+	njse := new(JobScalingEvents)
+	*njse = *j
+
+	njse.ScalingEvents = make(map[string][]*ScalingEvent, len(j.ScalingEvents))
+	for taskGroup, events := range j.ScalingEvents {
+		njse.ScalingEvents[taskGroup] = helper.CopySlice(events)
+	}
+
+	return njse
+}
+
 // NewScalingEvent method for ScalingEvent objects.
 func NewScalingEvent(message string) *ScalingEvent {
 	return &ScalingEvent{
@@ -5887,19 +6269,17 @@ type ScalingEvent struct {
 	CreateIndex uint64
 }
 
-func (e *ScalingEvent) SetError(error bool) *ScalingEvent {
-	e.Error = error
-	return e
-}
+func (e *ScalingEvent) Copy() *ScalingEvent {
+	if e == nil {
+		return nil
+	}
+	ne := new(ScalingEvent)
+	*ne = *e
 
-func (e *ScalingEvent) SetMeta(meta map[string]interface{}) *ScalingEvent {
-	e.Meta = meta
-	return e
-}
-
-func (e *ScalingEvent) SetEvalID(evalID string) *ScalingEvent {
-	e.EvalID = &evalID
-	return e
+	ne.Count = pointer.Copy(e.Count)
+	ne.Meta = maps.Clone(e.Meta)
+	ne.EvalID = pointer.Copy(e.EvalID)
+	return ne
 }
 
 // ScalingEventRequest is by for Job.Scale endpoint
@@ -5956,9 +6336,24 @@ const (
 	ScalingPolicyTypeHorizontal = "horizontal"
 )
 
-func (p *ScalingPolicy) Canonicalize() {
+func (p *ScalingPolicy) Canonicalize(job *Job, tg *TaskGroup, task *Task) {
 	if p.Type == "" {
 		p.Type = ScalingPolicyTypeHorizontal
+	}
+
+	// during restore we canonicalize to update, but these values will already
+	// have been populated during submit and we don't have references to the
+	// job, group, and task
+	if job != nil && tg != nil {
+		p.Target = map[string]string{
+			ScalingTargetNamespace: job.Namespace,
+			ScalingTargetJob:       job.ID,
+			ScalingTargetGroup:     tg.Name,
+		}
+
+		if task != nil {
+			p.Target[ScalingTargetTask] = task.Name
+		}
 	}
 }
 
@@ -6048,23 +6443,6 @@ func (p *ScalingPolicy) Diff(p2 *ScalingPolicy) bool {
 	return !reflect.DeepEqual(*p, copy)
 }
 
-// TargetTaskGroup updates a ScalingPolicy target to specify a given task group
-func (p *ScalingPolicy) TargetTaskGroup(job *Job, tg *TaskGroup) *ScalingPolicy {
-	p.Target = map[string]string{
-		ScalingTargetNamespace: job.Namespace,
-		ScalingTargetJob:       job.ID,
-		ScalingTargetGroup:     tg.Name,
-	}
-	return p
-}
-
-// TargetTask updates a ScalingPolicy target to specify a given task
-func (p *ScalingPolicy) TargetTask(job *Job, tg *TaskGroup, task *Task) *ScalingPolicy {
-	p.TargetTaskGroup(job, tg)
-	p.Target[ScalingTargetTask] = task.Name
-	return p
-}
-
 func (p *ScalingPolicy) Stub() *ScalingPolicyListStub {
 	stub := &ScalingPolicyListStub{
 		ID:          p.ID,
@@ -6132,6 +6510,9 @@ type RestartPolicy struct {
 	// Mode controls what happens when the task restarts more than attempt times
 	// in an interval.
 	Mode string
+
+	// RenderTemplates is flag to explicitly render all templates on task restart
+	RenderTemplates bool
 }
 
 func (r *RestartPolicy) Copy() *RestartPolicy {
@@ -6474,6 +6855,10 @@ type TaskGroup struct {
 	// RestartPolicy of a TaskGroup
 	RestartPolicy *RestartPolicy
 
+	// Disconnect strategy defines how both clients and server should behave in case of
+	// disconnection between them.
+	Disconnect *DisconnectStrategy
+
 	// Tasks are the collection of tasks that this task group needs to run
 	Tasks []*Task
 
@@ -6515,11 +6900,19 @@ type TaskGroup struct {
 
 	// StopAfterClientDisconnect, if set, configures the client to stop the task group
 	// after this duration since the last known good heartbeat
+	// To be deprecated after 1.8.0 infavor of Disconnect.StopOnClientAfter
 	StopAfterClientDisconnect *time.Duration
 
 	// MaxClientDisconnect, if set, configures the client to allow placed
 	// allocations for tasks in this group to attempt to resume running without a restart.
+	// To be deprecated after 1.8.0 infavor of Disconnect.LostAfter
 	MaxClientDisconnect *time.Duration
+
+	// PreventRescheduleOnLost is used to signal that an allocation should not
+	// be rescheduled if its node goes down or is disconnected.
+	// To be deprecated after 1.8.0
+	// To be deprecated after 1.8.0 infavor of Disconnect.Replace
+	PreventRescheduleOnLost bool
 }
 
 func (tg *TaskGroup) Copy() *TaskGroup {
@@ -6531,6 +6924,7 @@ func (tg *TaskGroup) Copy() *TaskGroup {
 	ntg.Update = ntg.Update.Copy()
 	ntg.Constraints = CopySliceConstraints(ntg.Constraints)
 	ntg.RestartPolicy = ntg.RestartPolicy.Copy()
+	ntg.Disconnect = ntg.Disconnect.Copy()
 	ntg.ReschedulePolicy = ntg.ReschedulePolicy.Copy()
 	ntg.Affinities = CopySliceAffinities(ntg.Affinities)
 	ntg.Spreads = CopySliceSpreads(ntg.Spreads)
@@ -6585,10 +6979,22 @@ func (tg *TaskGroup) Copy() *TaskGroup {
 
 // Canonicalize is used to canonicalize fields in the TaskGroup.
 func (tg *TaskGroup) Canonicalize(job *Job) {
-	// Ensure that an empty and nil map are treated the same to avoid scheduling
+	// Ensure that an empty and nil map or array are treated the same to avoid scheduling
 	// problems since we use reflect DeepEquals.
 	if len(tg.Meta) == 0 {
 		tg.Meta = nil
+	}
+
+	if len(tg.Constraints) == 0 {
+		tg.Constraints = nil
+	}
+
+	if len(tg.Affinities) == 0 {
+		tg.Affinities = nil
+	}
+
+	if len(tg.Spreads) == 0 {
+		tg.Spreads = nil
 	}
 
 	// Set the default restart policy.
@@ -6598,6 +7004,22 @@ func (tg *TaskGroup) Canonicalize(job *Job) {
 
 	if tg.ReschedulePolicy == nil {
 		tg.ReschedulePolicy = NewReschedulePolicy(job.Type)
+	}
+
+	if tg.Disconnect != nil {
+		tg.Disconnect.Canonicalize()
+
+		if tg.MaxClientDisconnect != nil && tg.Disconnect.LostAfter == 0 {
+			tg.Disconnect.LostAfter = *tg.MaxClientDisconnect
+		}
+
+		if tg.StopAfterClientDisconnect != nil && tg.Disconnect.StopOnClientAfter == nil {
+			tg.Disconnect.StopOnClientAfter = tg.StopAfterClientDisconnect
+		}
+
+		if tg.PreventRescheduleOnLost && tg.Disconnect.Replace == nil {
+			tg.Disconnect.Replace = pointer.Of(false)
+		}
 	}
 
 	// Canonicalize Migrate for service jobs
@@ -6610,12 +7032,8 @@ func (tg *TaskGroup) Canonicalize(job *Job) {
 		tg.EphemeralDisk = DefaultEphemeralDisk()
 	}
 
-	if job.Type == JobTypeSystem && tg.Count == 0 {
-		tg.Count = 1
-	}
-
 	if tg.Scaling != nil {
-		tg.Scaling.Canonicalize()
+		tg.Scaling.Canonicalize(job, tg, nil)
 	}
 
 	for _, service := range tg.Services {
@@ -6664,88 +7082,109 @@ func (tg *TaskGroup) filterServices(f func(s *Service) bool) []*Service {
 
 // Validate is used to check a task group for reasonable configuration
 func (tg *TaskGroup) Validate(j *Job) error {
-	var mErr multierror.Error
+	var mErr *multierror.Error
+
 	if tg.Name == "" {
-		mErr.Errors = append(mErr.Errors, errors.New("Missing task group name"))
+		mErr = multierror.Append(mErr, errors.New("Missing task group name"))
 	} else if strings.Contains(tg.Name, "\000") {
-		mErr.Errors = append(mErr.Errors, errors.New("Task group name contains null character"))
+		mErr = multierror.Append(mErr, errors.New("Task group name contains null character"))
 	}
+
 	if tg.Count < 0 {
-		mErr.Errors = append(mErr.Errors, errors.New("Task group count can't be negative"))
+		mErr = multierror.Append(mErr, errors.New("Task group count can't be negative"))
 	}
+
 	if len(tg.Tasks) == 0 {
 		// could be a lone consul gateway inserted by the connect mutator
-		mErr.Errors = append(mErr.Errors, errors.New("Missing tasks for task group"))
+		mErr = multierror.Append(mErr, errors.New("Missing tasks for task group"))
 	}
 
 	if tg.MaxClientDisconnect != nil && tg.StopAfterClientDisconnect != nil {
-		mErr.Errors = append(mErr.Errors, errors.New("Task group cannot be configured with both max_client_disconnect and stop_after_client_disconnect"))
+		mErr = multierror.Append(mErr, errors.New("Task group cannot be configured with both max_client_disconnect and stop_after_client_disconnect"))
 	}
 
 	if tg.MaxClientDisconnect != nil && *tg.MaxClientDisconnect < 0 {
-		mErr.Errors = append(mErr.Errors, errors.New("max_client_disconnect cannot be negative"))
+		mErr = multierror.Append(mErr, errors.New("max_client_disconnect cannot be negative"))
+	}
+
+	if tg.Disconnect != nil {
+		if tg.MaxClientDisconnect != nil && tg.Disconnect.LostAfter > 0 {
+			return multierror.Append(mErr, errors.New("using both lost_after and max_client_disconnect is not allowed"))
+		}
+
+		if tg.StopAfterClientDisconnect != nil && tg.Disconnect.StopOnClientAfter != nil {
+			return multierror.Append(mErr, errors.New("using both stop_after_client_disconnect and stop_on_client_after is not allowed"))
+		}
+
+		if tg.PreventRescheduleOnLost && tg.Disconnect.Replace != nil {
+			return multierror.Append(mErr, errors.New("using both prevent_reschedule_on_lost and replace is not allowed"))
+		}
+
+		if err := tg.Disconnect.Validate(j); err != nil {
+			mErr = multierror.Append(mErr, err)
+		}
 	}
 
 	for idx, constr := range tg.Constraints {
 		if err := constr.Validate(); err != nil {
 			outer := fmt.Errorf("Constraint %d validation failed: %s", idx+1, err)
-			mErr.Errors = append(mErr.Errors, outer)
+			mErr = multierror.Append(mErr, outer)
 		}
 	}
 	if j.Type == JobTypeSystem {
 		if tg.Affinities != nil {
-			mErr.Errors = append(mErr.Errors, fmt.Errorf("System jobs may not have an affinity block"))
+			mErr = multierror.Append(mErr, fmt.Errorf("System jobs may not have an affinity block"))
 		}
 	} else {
 		for idx, affinity := range tg.Affinities {
 			if err := affinity.Validate(); err != nil {
 				outer := fmt.Errorf("Affinity %d validation failed: %s", idx+1, err)
-				mErr.Errors = append(mErr.Errors, outer)
+				mErr = multierror.Append(mErr, outer)
 			}
 		}
 	}
 
 	if tg.RestartPolicy != nil {
 		if err := tg.RestartPolicy.Validate(); err != nil {
-			mErr.Errors = append(mErr.Errors, err)
+			mErr = multierror.Append(mErr, err)
 		}
 	} else {
-		mErr.Errors = append(mErr.Errors, fmt.Errorf("Task Group %v should have a restart policy", tg.Name))
+		mErr = multierror.Append(mErr, fmt.Errorf("Task Group %v should have a restart policy", tg.Name))
 	}
 
 	if j.Type == JobTypeSystem {
 		if tg.Spreads != nil {
-			mErr.Errors = append(mErr.Errors, fmt.Errorf("System jobs may not have a spread block"))
+			mErr = multierror.Append(mErr, fmt.Errorf("System jobs may not have a spread block"))
 		}
 	} else {
 		for idx, spread := range tg.Spreads {
 			if err := spread.Validate(); err != nil {
 				outer := fmt.Errorf("Spread %d validation failed: %s", idx+1, err)
-				mErr.Errors = append(mErr.Errors, outer)
+				mErr = multierror.Append(mErr, outer)
 			}
 		}
 	}
 
 	if j.Type == JobTypeSystem {
 		if tg.ReschedulePolicy != nil {
-			mErr.Errors = append(mErr.Errors, fmt.Errorf("System jobs should not have a reschedule policy"))
+			mErr = multierror.Append(mErr, fmt.Errorf("System jobs should not have a reschedule policy"))
 		}
 	} else {
 		if tg.ReschedulePolicy != nil {
 			if err := tg.ReschedulePolicy.Validate(); err != nil {
-				mErr.Errors = append(mErr.Errors, err)
+				mErr = multierror.Append(mErr, err)
 			}
 		} else {
-			mErr.Errors = append(mErr.Errors, fmt.Errorf("Task Group %v should have a reschedule policy", tg.Name))
+			mErr = multierror.Append(mErr, fmt.Errorf("Task Group %v should have a reschedule policy", tg.Name))
 		}
 	}
 
 	if tg.EphemeralDisk != nil {
 		if err := tg.EphemeralDisk.Validate(); err != nil {
-			mErr.Errors = append(mErr.Errors, err)
+			mErr = multierror.Append(mErr, err)
 		}
 	} else {
-		mErr.Errors = append(mErr.Errors, fmt.Errorf("Task Group %v should have an ephemeral disk object", tg.Name))
+		mErr = multierror.Append(mErr, fmt.Errorf("Task Group %v should have an ephemeral disk object", tg.Name))
 	}
 
 	// Validate the update strategy
@@ -6753,10 +7192,10 @@ func (tg *TaskGroup) Validate(j *Job) error {
 		switch j.Type {
 		case JobTypeService, JobTypeSystem:
 		default:
-			mErr.Errors = append(mErr.Errors, fmt.Errorf("Job type %q does not allow update block", j.Type))
+			mErr = multierror.Append(mErr, fmt.Errorf("Job type %q does not allow update block", j.Type))
 		}
 		if err := u.Validate(); err != nil {
-			mErr.Errors = append(mErr.Errors, err)
+			mErr = multierror.Append(mErr, err)
 		}
 	}
 
@@ -6765,12 +7204,12 @@ func (tg *TaskGroup) Validate(j *Job) error {
 	case JobTypeService:
 		if tg.Migrate != nil {
 			if err := tg.Migrate.Validate(); err != nil {
-				mErr.Errors = append(mErr.Errors, err)
+				mErr = multierror.Append(mErr, err)
 			}
 		}
 	default:
 		if tg.Migrate != nil {
-			mErr.Errors = append(mErr.Errors, fmt.Errorf("Job type %q does not allow migrate block", j.Type))
+			mErr = multierror.Append(mErr, fmt.Errorf("Job type %q does not allow migrate block", j.Type))
 		}
 	}
 
@@ -6779,9 +7218,9 @@ func (tg *TaskGroup) Validate(j *Job) error {
 	leaderTasks := 0
 	for idx, task := range tg.Tasks {
 		if task.Name == "" {
-			mErr.Errors = append(mErr.Errors, fmt.Errorf("Task %d missing name", idx+1))
+			mErr = multierror.Append(mErr, fmt.Errorf("Task %d missing name", idx+1))
 		} else if existing, ok := tasks[task.Name]; ok {
-			mErr.Errors = append(mErr.Errors, fmt.Errorf("Task %d redefines '%s' from task %d", idx+1, task.Name, existing+1))
+			mErr = multierror.Append(mErr, fmt.Errorf("Task %d redefines '%s' from task %d", idx+1, task.Name, existing+1))
 		} else {
 			tasks[task.Name] = idx
 		}
@@ -6792,7 +7231,7 @@ func (tg *TaskGroup) Validate(j *Job) error {
 	}
 
 	if leaderTasks > 1 {
-		mErr.Errors = append(mErr.Errors, fmt.Errorf("Only one task may be marked as leader"))
+		mErr = multierror.Append(mErr, fmt.Errorf("Only one task may be marked as leader"))
 	}
 
 	// Validate the volume requests
@@ -6802,7 +7241,7 @@ func (tg *TaskGroup) Validate(j *Job) error {
 	}
 	for name, volReq := range tg.Volumes {
 		if err := volReq.Validate(j.Type, tg.Count, canaries); err != nil {
-			mErr.Errors = append(mErr.Errors, fmt.Errorf(
+			mErr = multierror.Append(mErr, fmt.Errorf(
 				"Task group volume validation for %s failed: %v", name, err))
 		}
 	}
@@ -6810,32 +7249,32 @@ func (tg *TaskGroup) Validate(j *Job) error {
 	// Validate task group and task network resources
 	if err := tg.validateNetworks(); err != nil {
 		outer := fmt.Errorf("Task group network validation failed: %v", err)
-		mErr.Errors = append(mErr.Errors, outer)
+		mErr = multierror.Append(mErr, outer)
 	}
 
 	// Validate task group and task services
 	if err := tg.validateServices(); err != nil {
 		outer := fmt.Errorf("Task group service validation failed: %v", err)
-		mErr.Errors = append(mErr.Errors, outer)
+		mErr = multierror.Append(mErr, outer)
 	}
 
 	// Validate group service script-checks
 	if err := tg.validateScriptChecksInGroupServices(); err != nil {
 		outer := fmt.Errorf("Task group service check validation failed: %v", err)
-		mErr.Errors = append(mErr.Errors, outer)
+		mErr = multierror.Append(mErr, outer)
 	}
 
 	// Validate the scaling policy
 	if err := tg.validateScalingPolicy(j); err != nil {
 		outer := fmt.Errorf("Task group scaling policy validation failed: %v", err)
-		mErr.Errors = append(mErr.Errors, outer)
+		mErr = multierror.Append(mErr, outer)
 	}
 
 	// Validate the tasks
 	for _, task := range tg.Tasks {
 		if err := task.Validate(j.Type, tg); err != nil {
 			outer := fmt.Errorf("Task %s validation failed: %v", task.Name, err)
-			mErr.Errors = append(mErr.Errors, outer)
+			mErr = multierror.Append(mErr, outer)
 		}
 	}
 
@@ -6847,6 +7286,7 @@ func (tg *TaskGroup) validateNetworks() error {
 	portLabels := make(map[string]string)
 	// host_network -> static port tracking
 	staticPortsIndex := make(map[string]map[int]string)
+	cniArgKeys := set.New[string](len(tg.Networks))
 
 	for _, net := range tg.Networks {
 		for _, port := range append(net.ReservedPorts, net.DynamicPorts...) {
@@ -6867,8 +7307,10 @@ func (tg *TaskGroup) validateNetworks() error {
 				}
 				// static port
 				if other, ok := staticPorts[port.Value]; ok {
-					err := fmt.Errorf("Static port %d already reserved by %s", port.Value, other)
-					mErr.Errors = append(mErr.Errors, err)
+					if !port.IgnoreCollision {
+						err := fmt.Errorf("Static port %d already reserved by %s", port.Value, other)
+						mErr.Errors = append(mErr.Errors, err)
+					}
 				} else if port.Value > math.MaxUint16 {
 					err := fmt.Errorf("Port %s (%d) cannot be greater than %d", port.Label, port.Value, math.MaxUint16)
 					mErr.Errors = append(mErr.Errors, err)
@@ -6884,6 +7326,36 @@ func (tg *TaskGroup) validateNetworks() error {
 			} else if port.To > math.MaxUint16 {
 				err := fmt.Errorf("Port %q cannot be mapped to a port (%d) greater than %d", port.Label, port.To, math.MaxUint16)
 				mErr.Errors = append(mErr.Errors, err)
+			}
+
+			if port.IgnoreCollision && !(net.Mode == "" || net.Mode == "host") {
+				err := fmt.Errorf("Port %q collision may not be ignored on non-host network mode %q", port.Label, net.Mode)
+				mErr.Errors = append(mErr.Errors, err)
+			}
+		}
+		// Validate the cniArgs in each network resource. Make sure there are no duplicate Args in
+		// different network resources or invalid characters (;) in key or value ;)
+		if net.CNI != nil {
+			for k, v := range net.CNI.Args {
+				if cniArgKeys.Contains(k) {
+					err := fmt.Errorf("duplicate CNI arg %q", k)
+					mErr.Errors = append(mErr.Errors, err)
+				} else {
+					cniArgKeys.Insert(k)
+				}
+				// CNI_ARGS is a ";"-separated string of "key=val", so a ";"
+				// in either key or val would confuse plugins (or libraries)
+				// that parse that string.
+				// Pre-validating this here protects job authors from submitting
+				// a job that will most likely error later on the client anyway.
+				if strings.Contains(k, ";") {
+					err := fmt.Errorf("invalid ';' character in CNI arg key %q", k)
+					mErr.Errors = append(mErr.Errors, err)
+				}
+				if strings.Contains(v, ";") {
+					err := fmt.Errorf("invalid ';' character in CNI arg value %q", v)
+					mErr.Errors = append(mErr.Errors, err)
+				}
 			}
 		}
 
@@ -7134,15 +7606,35 @@ func (tg *TaskGroup) Warnings(j *Job) error {
 		}
 	}
 
+	if tg.MaxClientDisconnect != nil {
+		mErr.Errors = append(mErr.Errors, errors.New("MaxClientDisconnect will be deprecated favor of Disconnect.LostAfter"))
+	}
+
+	if tg.StopAfterClientDisconnect != nil {
+		mErr.Errors = append(mErr.Errors, errors.New("StopAfterClientDisconnect will be deprecated favor of Disconnect.StopOnClientAfter"))
+	}
+
+	if tg.PreventRescheduleOnLost {
+		mErr.Errors = append(mErr.Errors, errors.New("PreventRescheduleOnLost will be deprecated favor of Disconnect.Replace"))
+	}
+
 	// Check for mbits network field
 	if len(tg.Networks) > 0 && tg.Networks[0].MBits > 0 {
 		mErr.Errors = append(mErr.Errors, fmt.Errorf("mbits has been deprecated as of Nomad 0.12.0. Please remove mbits from the network block"))
 	}
 
+	// Validate group-level services.
+	for _, s := range tg.Services {
+		if err := s.Warnings(); err != nil {
+			err = multierror.Prefix(err, fmt.Sprintf("Service %q:", s.Name))
+			mErr = *multierror.Append(&mErr, err)
+		}
+	}
+
 	for _, t := range tg.Tasks {
 		if err := t.Warnings(); err != nil {
-			err = multierror.Prefix(err, fmt.Sprintf("Task %q:", t.Name))
-			mErr.Errors = append(mErr.Errors, err)
+			outer := fmt.Errorf("Task %q has warnings: %v", t.Name, err)
+			mErr.Errors = append(mErr.Errors, outer)
 		}
 	}
 
@@ -7190,6 +7682,59 @@ func (tg *TaskGroup) UsesConnectGateway() bool {
 
 func (tg *TaskGroup) GoString() string {
 	return fmt.Sprintf("*%#v", *tg)
+}
+
+// Replace is a helper meant to simplify the future depracation of
+// PreventRescheduleOnLost in favor of Disconnect.Replace
+// introduced in 1.8.0.
+func (tg *TaskGroup) Replace() bool {
+	if tg.PreventRescheduleOnLost {
+		return false
+	}
+
+	if tg.Disconnect == nil || tg.Disconnect.Replace == nil {
+		return true
+	}
+
+	return *tg.Disconnect.Replace
+}
+
+// GetDisconnectLostTimeout is a helper meant to simplify the future depracation of
+// MaxClientDisconnect in favor of Disconnect.LostAfter
+// introduced in 1.8.0.
+func (tg *TaskGroup) GetDisconnectLostTimeout() time.Duration {
+	if tg.MaxClientDisconnect != nil {
+		return *tg.MaxClientDisconnect
+	}
+
+	if tg.Disconnect != nil {
+		return tg.Disconnect.LostAfter
+	}
+
+	return 0
+}
+
+// GetDisconnectStopTimeout is a helper meant to simplify the future depracation of
+// StopAfterClientDisconnect in favor of Disconnect.StopOnClientAfter
+// introduced in 1.8.0.
+func (tg *TaskGroup) GetDisconnectStopTimeout() *time.Duration {
+	if tg.StopAfterClientDisconnect != nil {
+		return tg.StopAfterClientDisconnect
+	}
+
+	if tg.Disconnect != nil && tg.Disconnect.StopOnClientAfter != nil {
+		return tg.Disconnect.StopOnClientAfter
+	}
+
+	return nil
+}
+
+func (tg *TaskGroup) GetConstraints() []*Constraint {
+	return tg.Constraints
+}
+
+func (tg *TaskGroup) SetConstraints(newConstraints []*Constraint) {
+	tg.Constraints = newConstraints
 }
 
 // CheckRestart describes if and when a task should be restarted based on
@@ -7347,6 +7892,10 @@ type Task struct {
 	// have access to.
 	Vault *Vault
 
+	// Consul configuration specific to this task. If uset, falls back to the
+	// group's Consul field.
+	Consul *Consul
+
 	// Templates are the set of templates to be rendered for the task.
 	Templates []*Template
 
@@ -7410,9 +7959,22 @@ type Task struct {
 	// CSIPluginConfig is used to configure the plugin supervisor for the task.
 	CSIPluginConfig *TaskCSIPluginConfig
 
-	// Identity controls if and how the workload identity is exposed to
-	// tasks similar to the Vault block.
+	// Identity is the default Nomad Workload Identity.
 	Identity *WorkloadIdentity
+
+	// Identities are the alternate workload identities for use with 3rd party
+	// endpoints.
+	Identities []*WorkloadIdentity
+
+	// Alloc-exec-like runnable commands
+	Actions []*Action
+
+	// Schedule for pausing tasks. Enterprise only.
+	Schedule *TaskSchedule
+}
+
+func (t *Task) UsesCores() bool {
+	return t.Resources.Cores > 0
 }
 
 // UsesConnect is for conveniently detecting if the Task is able to make use
@@ -7446,6 +8008,34 @@ func (t *Task) IsPoststop() bool {
 		t.Lifecycle.Hook == TaskLifecycleHookPoststop
 }
 
+func (t *Task) GetIdentity(name string) *WorkloadIdentity {
+	for _, wid := range t.Identities {
+		if wid.Name == name {
+			return wid
+		}
+	}
+	return nil
+}
+
+func (t *Task) GetAction(name string) *Action {
+	for _, a := range t.Actions {
+		if a.Name == name {
+			return a
+		}
+	}
+	return nil
+}
+
+// IdentityHandle returns a WorkloadIdentityHandle which is a pair of unique WI
+// name and task name.
+func (t *Task) IdentityHandle(identity *WorkloadIdentity) *WIHandle {
+	return &WIHandle{
+		IdentityName:       identity.Name,
+		WorkloadIdentifier: t.Name,
+		WorkloadType:       WorkloadTypeTask,
+	}
+}
+
 func (t *Task) Copy() *Task {
 	if t == nil {
 		return nil
@@ -7468,12 +8058,15 @@ func (t *Task) Copy() *Task {
 	nt.CSIPluginConfig = nt.CSIPluginConfig.Copy()
 
 	nt.Vault = nt.Vault.Copy()
+	nt.Consul = nt.Consul.Copy()
 	nt.Resources = nt.Resources.Copy()
 	nt.LogConfig = nt.LogConfig.Copy()
 	nt.Meta = maps.Clone(nt.Meta)
 	nt.DispatchPayload = nt.DispatchPayload.Copy()
 	nt.Lifecycle = nt.Lifecycle.Copy()
 	nt.Identity = nt.Identity.Copy()
+	nt.Identities = helper.CopySlice(nt.Identities)
+	nt.Actions = helper.CopySlice(nt.Actions)
 
 	if t.Artifacts != nil {
 		artifacts := make([]*TaskArtifact, 0, len(t.Artifacts))
@@ -7502,7 +8095,7 @@ func (t *Task) Copy() *Task {
 
 // Canonicalize canonicalizes fields in the task.
 func (t *Task) Canonicalize(job *Job, tg *TaskGroup) {
-	// Ensure that an empty and nil map are treated the same to avoid scheduling
+	// Ensure that an empty and nil map or array are treated the same to avoid scheduling
 	// problems since we use reflect DeepEquals.
 	if len(t.Meta) == 0 {
 		t.Meta = nil
@@ -7512,6 +8105,17 @@ func (t *Task) Canonicalize(job *Job, tg *TaskGroup) {
 	}
 	if len(t.Env) == 0 {
 		t.Env = nil
+	}
+	if len(t.Constraints) == 0 {
+		t.Constraints = nil
+	}
+
+	if len(t.Affinities) == 0 {
+		t.Affinities = nil
+	}
+
+	if len(t.VolumeMounts) == 0 {
+		t.VolumeMounts = nil
 	}
 
 	for _, service := range t.Services {
@@ -7534,12 +8138,41 @@ func (t *Task) Canonicalize(job *Job, tg *TaskGroup) {
 		t.KillTimeout = DefaultKillTimeout
 	}
 
+	for _, policy := range t.ScalingPolicies {
+		policy.Canonicalize(job, tg, t)
+	}
+
 	if t.Vault != nil {
 		t.Vault.Canonicalize()
 	}
 
 	for _, template := range t.Templates {
 		template.Canonicalize()
+	}
+
+	// Initialize default Nomad workload identity
+	defaultIdx := -1
+	for i, wid := range t.Identities {
+		wid.Canonicalize()
+
+		// For backward compatibility put the default identity in Task.Identity.
+		if wid.Name == WorkloadIdentityDefaultName {
+			t.Identity = wid
+			defaultIdx = i
+		}
+	}
+
+	// If the default identity was found in Identities above, remove it from the
+	// slice.
+	if defaultIdx >= 0 {
+		t.Identities = slices.Delete(t.Identities, defaultIdx, defaultIdx+1)
+	}
+
+	// If there was no default identity, always create one.
+	if t.Identity == nil {
+		t.Identity = DefaultWorkloadIdentity()
+	} else {
+		t.Identity.Canonicalize()
 	}
 }
 
@@ -7661,6 +8294,22 @@ func (t *Task) Validate(jobType string, tg *TaskGroup) error {
 		}
 	}
 
+	// Validate actions.
+	actions := make(map[string]bool)
+	for _, action := range t.Actions {
+		if err := action.Validate(); err != nil {
+			outer := fmt.Errorf("Action %s validation failed: %s", action.Name, err)
+			mErr.Errors = append(mErr.Errors, outer)
+		}
+
+		if handled, seen := actions[action.Name]; seen && !handled {
+			mErr.Errors = append(mErr.Errors, fmt.Errorf("Action %s defined multiple times", action.Name))
+			actions[action.Name] = true
+			continue
+		}
+		actions[action.Name] = false
+	}
+
 	// Validate the dispatch payload block if there
 	if t.DispatchPayload != nil {
 		if err := t.DispatchPayload.Validate(); err != nil {
@@ -7695,15 +8344,12 @@ func (t *Task) Validate(jobType string, tg *TaskGroup) error {
 
 	// Validation for volumes
 	for idx, vm := range t.VolumeMounts {
-		if !MountPropagationModeIsValid(vm.PropagationMode) {
-			mErr.Errors = append(mErr.Errors, fmt.Errorf("Volume Mount (%d) has an invalid propagation mode: \"%s\"", idx, vm.PropagationMode))
+		if _, ok := tg.Volumes[vm.Volume]; !ok {
+			mErr.Errors = append(mErr.Errors, fmt.Errorf("Volume Mount (%d) references undefined volume %s", idx, vm.Volume))
 		}
 
-		// Validate the task does not reference undefined volume mounts
-		if vm.Volume == "" {
-			mErr.Errors = append(mErr.Errors, fmt.Errorf("Volume Mount (%d) references an empty volume", idx))
-		} else if _, ok := tg.Volumes[vm.Volume]; !ok {
-			mErr.Errors = append(mErr.Errors, fmt.Errorf("Volume Mount (%d) references undefined volume %s", idx, vm.Volume))
+		if err := vm.Validate(); err != nil {
+			mErr.Errors = append(mErr.Errors, fmt.Errorf("Volume Mount (%d) is invalid: \"%w\"", idx, err))
 		}
 	}
 
@@ -7717,7 +8363,32 @@ func (t *Task) Validate(jobType string, tg *TaskGroup) error {
 			mErr.Errors = append(mErr.Errors, fmt.Errorf("CSIPluginConfig PluginType must be one of 'node', 'controller', or 'monolith', got: \"%s\"", t.CSIPluginConfig.Type))
 		}
 
+		if t.CSIPluginConfig.StagePublishBaseDir != "" && t.CSIPluginConfig.MountDir != "" &&
+			strings.HasPrefix(t.CSIPluginConfig.StagePublishBaseDir, t.CSIPluginConfig.MountDir) {
+			mErr.Errors = append(mErr.Errors, fmt.Errorf("CSIPluginConfig StagePublishBaseDir must not be a subdirectory of MountDir, got: StagePublishBaseDir=\"%s\" MountDir=\"%s\"", t.CSIPluginConfig.StagePublishBaseDir, t.CSIPluginConfig.MountDir))
+		}
+
 		// TODO: Investigate validation of the PluginMountDir. Not much we can do apart from check IsAbs until after we understand its execution environment though :(
+	}
+
+	// Validate default Identity
+	if t.Identity != nil {
+		if err := t.Identity.Validate(); err != nil {
+			mErr.Errors = append(mErr.Errors, fmt.Errorf("Identity %q is invalid: %w", t.Identity.Name, err))
+		}
+	}
+
+	// Validate Identities
+	for _, wid := range t.Identities {
+		// Task.Canonicalize should move the default identity out of the Identities
+		// slice, so if one is found that means it is a duplicate.
+		if wid.Name == WorkloadIdentityDefaultName {
+			mErr.Errors = append(mErr.Errors, fmt.Errorf("Duplicate default identities found"))
+		}
+
+		if err := wid.Validate(); err != nil {
+			mErr.Errors = append(mErr.Errors, fmt.Errorf("Identity %q is invalid: %w", wid.Name, err))
+		}
 	}
 
 	return mErr.ErrorOrNil()
@@ -7890,11 +8561,34 @@ func (t *Task) Warnings() error {
 	for idx, tmpl := range t.Templates {
 		if err := tmpl.Warnings(); err != nil {
 			err = multierror.Prefix(err, fmt.Sprintf("Template[%d]", idx))
+			mErr = *multierror.Append(&mErr, err)
+		}
+	}
+
+	// Validate task-level services.
+	for _, s := range t.Services {
+		if err := s.Warnings(); err != nil {
+			err = multierror.Prefix(err, fmt.Sprintf("Service %q:", s.Name))
+			mErr = *multierror.Append(&mErr, err)
+		}
+	}
+
+	for _, wid := range t.Identities {
+		if err := wid.Warnings(); err != nil {
+			err = multierror.Prefix(err, fmt.Sprintf("Identity[%s]", wid.Name))
 			mErr.Errors = append(mErr.Errors, err)
 		}
 	}
 
 	return mErr.ErrorOrNil()
+}
+
+func (t *Task) GetConstraints() []*Constraint {
+	return t.Constraints
+}
+
+func (t *Task) SetConstraints(newConstraints []*Constraint) {
+	t.Constraints = newConstraints
 }
 
 // TaskKind identifies the special kinds of tasks using the following format:
@@ -8386,44 +9080,6 @@ type AllocState struct {
 	Time  time.Time
 }
 
-// TaskHandle is  optional handle to a task propogated to the servers for use
-// by remote tasks. Since remote tasks are not implicitly lost when the node
-// they are assigned to is down, their state is migrated to the replacement
-// allocation.
-//
-// Minimal set of fields from plugins/drivers/task_handle.go:TaskHandle
-type TaskHandle struct {
-	// Version of driver state. Used by the driver to gracefully handle
-	// plugin upgrades.
-	Version int
-
-	// Driver-specific state containing a handle to the remote task.
-	DriverState []byte
-}
-
-func (h *TaskHandle) Copy() *TaskHandle {
-	if h == nil {
-		return nil
-	}
-
-	newTH := TaskHandle{
-		Version:     h.Version,
-		DriverState: make([]byte, len(h.DriverState)),
-	}
-	copy(newTH.DriverState, h.DriverState)
-	return &newTH
-}
-
-func (h *TaskHandle) Equal(o *TaskHandle) bool {
-	if h == nil || o == nil {
-		return h == o
-	}
-	if h.Version != o.Version {
-		return false
-	}
-	return bytes.Equal(h.DriverState, o.DriverState)
-}
-
 // Set of possible states for a task.
 const (
 	TaskStatePending = "pending" // The task is waiting to be run.
@@ -8458,9 +9114,13 @@ type TaskState struct {
 	// Series of task events that transition the state of the task.
 	Events []*TaskEvent
 
-	// Experimental -  TaskHandle is based on drivers.TaskHandle and used
-	// by remote task drivers to migrate task handles between allocations.
-	TaskHandle *TaskHandle
+	// // Experimental -  TaskHandle is based on drivers.TaskHandle and used
+	// // by remote task drivers to migrate task handles between allocations.
+	// TaskHandle *TaskHandle
+
+	// Enterprise Only - Paused is set to the paused state of the task. See
+	// task_sched.go
+	Paused TaskScheduleState
 }
 
 // NewTaskState returns a TaskState initialized in the Pending state.
@@ -8492,7 +9152,6 @@ func (ts *TaskState) Copy() *TaskState {
 		}
 	}
 
-	newTS.TaskHandle = ts.TaskHandle.Copy()
 	return newTS
 }
 
@@ -8527,9 +9186,6 @@ func (ts *TaskState) Equal(o *TaskState) bool {
 	}) {
 		return false
 	}
-	if !ts.TaskHandle.Equal(o.TaskHandle) {
-		return false
-	}
 
 	return true
 }
@@ -8554,6 +9210,10 @@ const (
 	// TaskStarted signals that the task was started and its timestamp can be
 	// used to determine the running length of the task.
 	TaskStarted = "Started"
+
+	// TaskPausing indicates the task is being killed, but will be
+	// started again to await the next start of its task schedule (Enterprise).
+	TaskPausing = "Pausing"
 
 	// TaskTerminated indicates that the task was started and exited.
 	TaskTerminated = "Terminated"
@@ -8629,7 +9289,7 @@ const (
 	// TaskPluginHealthy indicates that a plugin managed by Nomad became healthy
 	TaskPluginHealthy = "Plugin became healthy"
 
-	// TaskClientReconnected indicates that the client running the task disconnected.
+	// TaskClientReconnected indicates that the client running the task reconnected.
 	TaskClientReconnected = "Reconnected"
 
 	// TaskWaitingShuttingDownDelay indicates that the task is waiting for
@@ -8639,6 +9299,10 @@ const (
 	// TaskSkippingShutdownDelay indicates that the task operation was
 	// configured to ignore the shutdown delay value set for the tas.
 	TaskSkippingShutdownDelay = "Skipping shutdown delay"
+
+	// TaskRunning indicates a task is running due to a schedule or schedule
+	// override. (Enterprise)
+	TaskRunning = "Running"
 )
 
 // TaskEvent is an event that effects the state of a task and contains meta-data
@@ -9025,7 +9689,7 @@ func (e *TaskEvent) SetValidationError(err error) *TaskEvent {
 }
 
 func (e *TaskEvent) SetKillTimeout(timeout, maxTimeout time.Duration) *TaskEvent {
-	actual := helper.Min(timeout, maxTimeout)
+	actual := min(timeout, maxTimeout)
 	e.KillTimeout = actual
 	e.Details["kill_timeout"] = actual.String()
 	return e
@@ -9079,9 +9743,18 @@ type TaskArtifact struct {
 	// Defaults to "any" but can be set to "file" or "dir".
 	GetterMode string
 
+	// GetterInsecure is a flag to disable SSL certificate verification when
+	// downloading the artifact using go-getter.
+	GetterInsecure bool
+
 	// RelativeDest is the download destination given relative to the task's
 	// directory.
 	RelativeDest string
+
+	// Chown the resulting files and directories to the user of the task.
+	//
+	// Defaults to false.
+	Chown bool
 }
 
 func (ta *TaskArtifact) Equal(o *TaskArtifact) bool {
@@ -9097,7 +9770,11 @@ func (ta *TaskArtifact) Equal(o *TaskArtifact) bool {
 		return false
 	case ta.GetterMode != o.GetterMode:
 		return false
+	case ta.GetterInsecure != o.GetterInsecure:
+		return false
 	case ta.RelativeDest != o.RelativeDest:
+		return false
+	case ta.Chown != o.Chown:
 		return false
 	}
 	return true
@@ -9108,11 +9785,13 @@ func (ta *TaskArtifact) Copy() *TaskArtifact {
 		return nil
 	}
 	return &TaskArtifact{
-		GetterSource:  ta.GetterSource,
-		GetterOptions: maps.Clone(ta.GetterOptions),
-		GetterHeaders: maps.Clone(ta.GetterHeaders),
-		GetterMode:    ta.GetterMode,
-		RelativeDest:  ta.RelativeDest,
+		GetterSource:   ta.GetterSource,
+		GetterOptions:  maps.Clone(ta.GetterOptions),
+		GetterHeaders:  maps.Clone(ta.GetterHeaders),
+		GetterMode:     ta.GetterMode,
+		GetterInsecure: ta.GetterInsecure,
+		RelativeDest:   ta.RelativeDest,
+		Chown:          ta.Chown,
 	}
 }
 
@@ -9152,7 +9831,9 @@ func (ta *TaskArtifact) Hash() string {
 	hashStringMap(h, ta.GetterHeaders)
 
 	_, _ = h.Write([]byte(ta.GetterMode))
+	_, _ = h.Write([]byte(strconv.FormatBool(ta.GetterInsecure)))
 	_, _ = h.Write([]byte(ta.RelativeDest))
+	_, _ = h.Write([]byte(strconv.FormatBool(ta.Chown)))
 	return base64.RawStdEncoding.EncodeToString(h.Sum(nil))
 }
 
@@ -9675,15 +10356,25 @@ const (
 
 // Vault stores the set of permissions a task needs access to from Vault.
 type Vault struct {
-	// Policies is the set of policies that the task needs access to
-	Policies []string
+	// Role is the Vault role used to login to Vault using a JWT.
+	//
+	// If empty, defaults to the server's create_from_role value or the Vault
+	// cluster default role.
+	Role string
 
 	// Namespace is the vault namespace that should be used.
 	Namespace string
 
+	// Cluster (by name) to send API requests to
+	Cluster string
+
 	// Env marks whether the Vault Token should be exposed as an environment
 	// variable
 	Env bool
+
+	// DisableFile marks whether the Vault Token should be exposed in the file
+	// vault_token in the task's secrets directory.
+	DisableFile bool
 
 	// ChangeMode is used to configure the task's behavior when the Vault
 	// token changes because the original token could not be renewed in time.
@@ -9692,13 +10383,15 @@ type Vault struct {
 	// ChangeSignal is the signal sent to the task when a new token is
 	// retrieved. This is only valid when using the signal change mode.
 	ChangeSignal string
+
+	// AllowTokenExpiration disables the Vault token refresh loop on the client
+	AllowTokenExpiration bool
 }
 
-func DefaultVaultBlock() *Vault {
-	return &Vault{
-		Env:        true,
-		ChangeMode: VaultChangeModeRestart,
-	}
+// IdentityName returns the name of the workload identity to be used to access
+// this Vault cluster.
+func (v *Vault) IdentityName() string {
+	return fmt.Sprintf("%s%s", WorkloadIdentityVaultPrefix, v.Cluster)
 }
 
 func (v *Vault) Equal(o *Vault) bool {
@@ -9706,15 +10399,21 @@ func (v *Vault) Equal(o *Vault) bool {
 		return v == o
 	}
 	switch {
-	case !slices.Equal(v.Policies, o.Policies):
+	case v.Role != o.Role:
 		return false
 	case v.Namespace != o.Namespace:
 		return false
+	case v.Cluster != o.Cluster:
+		return false
 	case v.Env != o.Env:
+		return false
+	case v.DisableFile != o.DisableFile:
 		return false
 	case v.ChangeMode != o.ChangeMode:
 		return false
 	case v.ChangeSignal != o.ChangeSignal:
+		return false
+	case v.AllowTokenExpiration != o.AllowTokenExpiration:
 		return false
 	}
 	return true
@@ -9732,6 +10431,9 @@ func (v *Vault) Copy() *Vault {
 }
 
 func (v *Vault) Canonicalize() {
+	// The Vault cluster name is canonicalized in the jobVaultHook during job
+	// registration because the value may be read from the server config.
+
 	if v.ChangeSignal != "" {
 		v.ChangeSignal = strings.ToUpper(v.ChangeSignal)
 	}
@@ -9748,15 +10450,6 @@ func (v *Vault) Validate() error {
 	}
 
 	var mErr multierror.Error
-	if len(v.Policies) == 0 {
-		_ = multierror.Append(&mErr, fmt.Errorf("Policy list cannot be empty"))
-	}
-
-	for _, p := range v.Policies {
-		if p == "root" {
-			_ = multierror.Append(&mErr, fmt.Errorf("Can not specify \"root\" policy"))
-		}
-	}
 
 	switch v.ChangeMode {
 	case VaultChangeModeSignal:
@@ -9873,10 +10566,14 @@ type Deployment struct {
 
 	CreateIndex uint64
 	ModifyIndex uint64
+
+	// Creation and modification times, stored as UnixNano
+	CreateTime int64
+	ModifyTime int64
 }
 
 // NewDeployment creates a new deployment given the job.
-func NewDeployment(job *Job, evalPriority int) *Deployment {
+func NewDeployment(job *Job, evalPriority int, now int64) *Deployment {
 	return &Deployment{
 		ID:                 uuid.Generate(),
 		Namespace:          job.Namespace,
@@ -9890,6 +10587,7 @@ func NewDeployment(job *Job, evalPriority int) *Deployment {
 		StatusDescription:  DeploymentStatusDescriptionRunning,
 		TaskGroups:         make(map[string]*DeploymentState, len(job.TaskGroups)),
 		EvalPriority:       evalPriority,
+		CreateTime:         now,
 	}
 }
 
@@ -10069,12 +10767,26 @@ type DeploymentStatusUpdate struct {
 
 	// StatusDescription is the new status description of the deployment.
 	StatusDescription string
+
+	// UpdatedAt is the time of the update, stored as UnixNano
+	UpdatedAt int64
 }
 
 // RescheduleTracker encapsulates previous reschedule events
 type RescheduleTracker struct {
 	Events []*RescheduleEvent
+
+	// LastReschedule represents whether the most recent attempt to reschedule
+	// the allocation (if any) was successful
+	LastReschedule RescheduleTrackerAnnotation
 }
+
+type RescheduleTrackerAnnotation string
+
+const (
+	LastRescheduleSuccess       RescheduleTrackerAnnotation = "ok"
+	LastRescheduleFailedToPlace RescheduleTrackerAnnotation = "no placement"
+)
 
 func (rt *RescheduleTracker) Copy() *RescheduleTracker {
 	if rt == nil {
@@ -10088,6 +10800,46 @@ func (rt *RescheduleTracker) Copy() *RescheduleTracker {
 	}
 	nt.Events = rescheduleEvents
 	return nt
+}
+
+func (rt *RescheduleTracker) RescheduleEligible(reschedulePolicy *ReschedulePolicy, failTime time.Time) bool {
+	if reschedulePolicy == nil {
+		return false
+	}
+	attempts := reschedulePolicy.Attempts
+	enabled := attempts > 0 || reschedulePolicy.Unlimited
+	if !enabled {
+		return false
+	}
+	if reschedulePolicy.Unlimited {
+		return true
+	}
+	// Early return true if there are no attempts yet and the number of allowed attempts is > 0
+	if (rt == nil || len(rt.Events) == 0) && attempts > 0 {
+		return true
+	}
+	attempted, _ := rt.rescheduleInfo(reschedulePolicy, failTime)
+	return attempted < attempts
+}
+
+func (rt *RescheduleTracker) rescheduleInfo(reschedulePolicy *ReschedulePolicy, failTime time.Time) (int, int) {
+	if reschedulePolicy == nil {
+		return 0, 0
+	}
+	attempts := reschedulePolicy.Attempts
+	interval := reschedulePolicy.Interval
+
+	attempted := 0
+	if rt != nil && attempts > 0 {
+		for j := len(rt.Events) - 1; j >= 0; j-- {
+			lastAttempt := rt.Events[j].RescheduleTime
+			timeDiff := failTime.UTC().UnixNano() - lastAttempt
+			if timeDiff < interval.Nanoseconds() {
+				attempted += 1
+			}
+		}
+	}
+	return attempted, attempts
 }
 
 // RescheduleEvent is used to keep track of previous attempts at rescheduling an allocation
@@ -10210,6 +10962,14 @@ const (
 	AllocClientStatusLost     = "lost"
 	AllocClientStatusUnknown  = "unknown"
 )
+
+// terminalAllocationStatuses lists allocation statutes that we consider
+// terminal
+var terminalAllocationStatuses = []string{
+	AllocClientStatusComplete,
+	AllocClientStatusFailed,
+	AllocClientStatusLost,
+}
 
 // Allocation is used to allocate the placement of a task group to a node.
 type Allocation struct {
@@ -10339,10 +11099,10 @@ type Allocation struct {
 	AllocModifyIndex uint64
 
 	// CreateTime is the time the allocation has finished scheduling and been
-	// verified by the plan applier.
+	// verified by the plan applier, stored as UnixNano.
 	CreateTime int64
 
-	// ModifyTime is the time the allocation was last updated.
+	// ModifyTime is the time the allocation was last updated stored as UnixNano.
 	ModifyTime int64
 }
 
@@ -10352,6 +11112,23 @@ func (a *Allocation) GetID() string {
 		return ""
 	}
 	return a.ID
+}
+
+// Sanitize returns a copy of the allocation with the SignedIdentities field
+// removed. This is useful for returning allocations to clients where the
+// SignedIdentities field is not needed.
+func (a *Allocation) Sanitize() *Allocation {
+	if a == nil {
+		return nil
+	}
+
+	if a.SignedIdentities == nil {
+		return a
+	}
+
+	clean := a.Copy()
+	clean.SignedIdentities = nil
+	return clean
 }
 
 // GetNamespace implements the NamespaceGetter interface, required for
@@ -10373,10 +11150,36 @@ func (a *Allocation) GetCreateIndex() uint64 {
 	return a.CreateIndex
 }
 
+// ReservedCores returns the union of reserved cores across tasks in this alloc.
+func (a *Allocation) ReservedCores() *idset.Set[hw.CoreID] {
+	s := idset.Empty[hw.CoreID]()
+	if a == nil || a.AllocatedResources == nil {
+		return s
+	}
+	for _, taskResources := range a.AllocatedResources.Tasks {
+		if len(taskResources.Cpu.ReservedCores) > 0 {
+			for _, core := range taskResources.Cpu.ReservedCores {
+				s.Insert(hw.CoreID(core))
+			}
+		}
+	}
+	return s
+}
+
 // ConsulNamespace returns the Consul namespace of the task group associated
 // with this allocation.
 func (a *Allocation) ConsulNamespace() string {
 	return a.Job.LookupTaskGroup(a.TaskGroup).Consul.GetNamespace()
+}
+
+func (a *Allocation) ConsulNamespaceForTask(taskName string) string {
+	tg := a.Job.LookupTaskGroup(a.TaskGroup)
+	task := tg.LookupTask(taskName)
+	if task.Consul != nil {
+		return task.Consul.GetNamespace()
+	}
+
+	return tg.Consul.GetNamespace()
 }
 
 func (a *Allocation) JobNamespacedID() NamespacedID {
@@ -10386,13 +11189,19 @@ func (a *Allocation) JobNamespacedID() NamespacedID {
 // Index returns the index of the allocation. If the allocation is from a task
 // group with count greater than 1, there will be multiple allocations for it.
 func (a *Allocation) Index() uint {
-	l := len(a.Name)
-	prefix := len(a.JobID) + len(a.TaskGroup) + 2
+	return AllocIndexFromName(a.Name, a.JobID, a.TaskGroup)
+}
+
+// AllocIndexFromName returns the index of an allocation given its name, the
+// jobID and the task group name.
+func AllocIndexFromName(allocName, jobID, taskGroup string) uint {
+	l := len(allocName)
+	prefix := len(jobID) + len(taskGroup) + 2
 	if l <= 3 || l <= prefix {
 		return uint(0)
 	}
 
-	strNum := a.Name[prefix : len(a.Name)-1]
+	strNum := allocName[prefix : len(allocName)-1]
 	num, _ := strconv.Atoi(strNum)
 	return uint(num)
 }
@@ -10496,12 +11305,7 @@ func (a *Allocation) ServerTerminalStatus() bool {
 
 // ClientTerminalStatus returns if the client status is terminal and will no longer transition
 func (a *Allocation) ClientTerminalStatus() bool {
-	switch a.ClientStatus {
-	case AllocClientStatusComplete, AllocClientStatusFailed, AllocClientStatusLost:
-		return true
-	default:
-		return false
-	}
+	return slices.Contains(terminalAllocationStatuses, a.ClientStatus)
 }
 
 // ShouldReschedule returns if the allocation is eligible to be rescheduled according
@@ -10524,47 +11328,11 @@ func (a *Allocation) ShouldReschedule(reschedulePolicy *ReschedulePolicy, failTi
 // RescheduleEligible returns if the allocation is eligible to be rescheduled according
 // to its ReschedulePolicy and the current state of its reschedule trackers
 func (a *Allocation) RescheduleEligible(reschedulePolicy *ReschedulePolicy, failTime time.Time) bool {
-	if reschedulePolicy == nil {
-		return false
-	}
-	attempts := reschedulePolicy.Attempts
-	enabled := attempts > 0 || reschedulePolicy.Unlimited
-	if !enabled {
-		return false
-	}
-	if reschedulePolicy.Unlimited {
-		return true
-	}
-	// Early return true if there are no attempts yet and the number of allowed attempts is > 0
-	if (a.RescheduleTracker == nil || len(a.RescheduleTracker.Events) == 0) && attempts > 0 {
-		return true
-	}
-	attempted, _ := a.rescheduleInfo(reschedulePolicy, failTime)
-	return attempted < attempts
-}
-
-func (a *Allocation) rescheduleInfo(reschedulePolicy *ReschedulePolicy, failTime time.Time) (int, int) {
-	if reschedulePolicy == nil {
-		return 0, 0
-	}
-	attempts := reschedulePolicy.Attempts
-	interval := reschedulePolicy.Interval
-
-	attempted := 0
-	if a.RescheduleTracker != nil && attempts > 0 {
-		for j := len(a.RescheduleTracker.Events) - 1; j >= 0; j-- {
-			lastAttempt := a.RescheduleTracker.Events[j].RescheduleTime
-			timeDiff := failTime.UTC().UnixNano() - lastAttempt
-			if timeDiff < interval.Nanoseconds() {
-				attempted += 1
-			}
-		}
-	}
-	return attempted, attempts
+	return a.RescheduleTracker.RescheduleEligible(reschedulePolicy, failTime)
 }
 
 func (a *Allocation) RescheduleInfo() (int, int) {
-	return a.rescheduleInfo(a.ReschedulePolicy(), a.LastEventTime())
+	return a.RescheduleTracker.rescheduleInfo(a.ReschedulePolicy(), a.LastEventTime())
 }
 
 // LastEventTime is the time of the last task event in the allocation.
@@ -10609,7 +11377,15 @@ func (a *Allocation) MigrateStrategy() *MigrateStrategy {
 func (a *Allocation) NextRescheduleTime() (time.Time, bool) {
 	failTime := a.LastEventTime()
 	reschedulePolicy := a.ReschedulePolicy()
-	if a.DesiredStatus == AllocDesiredStatusStop || a.ClientStatus != AllocClientStatusFailed || failTime.IsZero() || reschedulePolicy == nil {
+
+	//If reschedule is disabled, return early
+	if reschedulePolicy.Attempts == 0 && !reschedulePolicy.Unlimited {
+		return time.Time{}, false
+	}
+
+	if (a.DesiredStatus == AllocDesiredStatusStop && !a.LastRescheduleFailed()) ||
+		(a.ClientStatus != AllocClientStatusFailed && a.ClientStatus != AllocClientStatusLost) ||
+		failTime.IsZero() || reschedulePolicy == nil {
 		return time.Time{}, false
 	}
 
@@ -10622,30 +11398,42 @@ func (a *Allocation) nextRescheduleTime(failTime time.Time, reschedulePolicy *Re
 	rescheduleEligible := reschedulePolicy.Unlimited || (reschedulePolicy.Attempts > 0 && a.RescheduleTracker == nil)
 	if reschedulePolicy.Attempts > 0 && a.RescheduleTracker != nil && a.RescheduleTracker.Events != nil {
 		// Check for eligibility based on the interval if max attempts is set
-		attempted, attempts := a.rescheduleInfo(reschedulePolicy, failTime)
+		attempted, attempts := a.RescheduleTracker.rescheduleInfo(reschedulePolicy, failTime)
 		rescheduleEligible = attempted < attempts && nextDelay < reschedulePolicy.Interval
 	}
 	return nextRescheduleTime, rescheduleEligible
 }
 
-// NextRescheduleTimeByFailTime works like NextRescheduleTime but allows callers
+// NextRescheduleTimeByTime works like NextRescheduleTime but allows callers
 // specify a failure time. Useful for things like determining whether to reschedule
 // an alloc on a disconnected node.
-func (a *Allocation) NextRescheduleTimeByFailTime(failTime time.Time) (time.Time, bool) {
+func (a *Allocation) NextRescheduleTimeByTime(t time.Time) (time.Time, bool) {
 	reschedulePolicy := a.ReschedulePolicy()
 	if reschedulePolicy == nil {
 		return time.Time{}, false
 	}
 
-	return a.nextRescheduleTime(failTime, reschedulePolicy)
+	return a.nextRescheduleTime(t, reschedulePolicy)
 }
 
-// ShouldClientStop tests an alloc for StopAfterClientDisconnect configuration
+func (a *Allocation) RescheduleTimeOnDisconnect(now time.Time) (time.Time, bool) {
+	tg := a.Job.LookupTaskGroup(a.TaskGroup)
+	if tg == nil || tg.Disconnect == nil || tg.Disconnect.Replace == nil {
+		// Kept to maintain backwards compatibility with behavior prior to 1.8.0
+		return a.NextRescheduleTimeByTime(now)
+	}
+
+	return now, *tg.Disconnect.Replace
+}
+
+// ShouldClientStop tests an alloc for StopAfterClient on the Disconnect configuration
 func (a *Allocation) ShouldClientStop() bool {
 	tg := a.Job.LookupTaskGroup(a.TaskGroup)
+	timeout := tg.GetDisconnectStopTimeout()
+
 	if tg == nil ||
-		tg.StopAfterClientDisconnect == nil ||
-		*tg.StopAfterClientDisconnect == 0*time.Nanosecond {
+		timeout == nil ||
+		*timeout == 0*time.Nanosecond {
 		return false
 	}
 	return true
@@ -10680,7 +11468,7 @@ func (a *Allocation) WaitClientStop() time.Time {
 		}
 	}
 
-	return t.Add(*tg.StopAfterClientDisconnect + kill)
+	return t.Add(*tg.GetDisconnectStopTimeout() + kill)
 }
 
 // DisconnectTimeout uses the MaxClientDisconnect to compute when the allocation
@@ -10692,13 +11480,12 @@ func (a *Allocation) DisconnectTimeout(now time.Time) time.Time {
 
 	tg := a.Job.LookupTaskGroup(a.TaskGroup)
 
-	timeout := tg.MaxClientDisconnect
-
-	if timeout == nil {
+	timeout := tg.GetDisconnectLostTimeout()
+	if timeout == 0 {
 		return now
 	}
 
-	return now.Add(*timeout)
+	return now.Add(timeout)
 }
 
 // SupportsDisconnectedClients determines whether both the server and the task group
@@ -10712,7 +11499,22 @@ func (a *Allocation) SupportsDisconnectedClients(serverSupportsDisconnectedClien
 	if a.Job != nil {
 		tg := a.Job.LookupTaskGroup(a.TaskGroup)
 		if tg != nil {
-			return tg.MaxClientDisconnect != nil
+			return tg.GetDisconnectLostTimeout() != 0
+		}
+	}
+
+	return false
+}
+
+// PreventRescheduleOnLost determines if an alloc allows to have a replacement
+// when Disconnected.
+func (a *Allocation) PreventRescheduleOnDisconnect() bool {
+	if a.Job != nil {
+		tg := a.Job.LookupTaskGroup(a.TaskGroup)
+		if tg != nil {
+			return (tg.Disconnect != nil && tg.Disconnect.Replace != nil &&
+				!*tg.Disconnect.Replace) ||
+				tg.PreventRescheduleOnLost
 		}
 	}
 
@@ -10844,46 +11646,6 @@ func (a *Allocation) SetEventDisplayMessages() {
 	setDisplayMsg(a.TaskStates)
 }
 
-// ComparableResources returns the resources on the allocation
-// handling upgrade paths. After 0.11 calls to this should be replaced with:
-// alloc.AllocatedResources.Comparable()
-//
-// COMPAT(0.11): Remove in 0.11
-func (a *Allocation) ComparableResources() *ComparableResources {
-	// Alloc already has 0.9+ behavior
-	if a.AllocatedResources != nil {
-		return a.AllocatedResources.Comparable()
-	}
-
-	var resources *Resources
-	if a.Resources != nil {
-		resources = a.Resources
-	} else if a.TaskResources != nil {
-		resources = new(Resources)
-		resources.Add(a.SharedResources)
-		for _, taskResource := range a.TaskResources {
-			resources.Add(taskResource)
-		}
-	}
-
-	// Upgrade path
-	return &ComparableResources{
-		Flattened: AllocatedTaskResources{
-			Cpu: AllocatedCpuResources{
-				CpuShares: int64(resources.CPU),
-			},
-			Memory: AllocatedMemoryResources{
-				MemoryMB:    int64(resources.MemoryMB),
-				MemoryMaxMB: int64(resources.MemoryMaxMB),
-			},
-			Networks: resources.Networks,
-		},
-		Shared: AllocatedSharedResources{
-			DiskMB: int64(resources.DiskMB),
-		},
-	}
-}
-
 // LookupTask by name from the Allocation. Returns nil if the Job is not set, the
 // TaskGroup does not exist, or the task name cannot be found.
 func (a *Allocation) LookupTask(name string) *Task {
@@ -10950,7 +11712,7 @@ func (a *Allocation) AllocationDiff() *AllocationDiff {
 	return (*AllocationDiff)(a)
 }
 
-// Expired determines whether an allocation has exceeded its MaxClientDisonnect
+// Expired determines whether an allocation has exceeded its Disconnect.LostAfter
 // duration relative to the passed time stamp.
 func (a *Allocation) Expired(now time.Time) bool {
 	if a == nil || a.Job == nil {
@@ -10972,12 +11734,13 @@ func (a *Allocation) Expired(now time.Time) bool {
 		return false
 	}
 
-	if tg.MaxClientDisconnect == nil {
+	timeout := tg.GetDisconnectLostTimeout()
+	if timeout == 0 && tg.Replace() {
 		return false
 	}
 
-	expiry := lastUnknown.Add(*tg.MaxClientDisconnect)
-	return now.UTC().After(expiry) || now.UTC().Equal(expiry)
+	expiry := lastUnknown.Add(timeout)
+	return expiry.Sub(now) <= 0
 }
 
 // LastUnknown returns the timestamp for the last time the allocation
@@ -11017,44 +11780,47 @@ func (a *Allocation) NeedsToReconnect() bool {
 	return disconnected
 }
 
-func (a *Allocation) ToIdentityClaims(job *Job) *IdentityClaims {
-	now := jwt.NewNumericDate(time.Now().UTC())
-	claims := &IdentityClaims{
-		Namespace:    a.Namespace,
-		JobID:        a.JobID,
-		AllocationID: a.ID,
-		RegisteredClaims: jwt.RegisteredClaims{
-			// TODO: implement a refresh loop to prevent allocation identities from
-			// expiring before the allocation is terminal. Once that's implemented,
-			// add an ExpiresAt here ExpiresAt: &jwt.NumericDate{}
-			// https://github.com/hashicorp/nomad/issues/16258
-			NotBefore: now,
-			IssuedAt:  now,
-		},
+// LastStartOfTask returns the time of the last start event for the given task
+// using the allocations TaskStates. If the task has not started, the zero time
+// will be returned.
+func (a *Allocation) LastStartOfTask(taskName string) time.Time {
+	task := a.TaskStates[taskName]
+	if task == nil {
+		return time.Time{}
 	}
-	if job != nil && job.ParentID != "" {
-		claims.JobID = job.ParentID
+
+	if task.Restarts > 0 {
+		return task.LastRestart
 	}
-	return claims
+
+	return task.StartedAt
 }
 
-func (a *Allocation) ToTaskIdentityClaims(job *Job, taskName string) *IdentityClaims {
-	claims := a.ToIdentityClaims(job)
-	if claims != nil {
-		claims.TaskName = taskName
+// HasAnyPausedTasks returns true if any of the TaskStates on the alloc
+// are Paused (Enterprise feature) either due to a schedule or being forced.
+func (a *Allocation) HasAnyPausedTasks() bool {
+	if a == nil {
+		return false
 	}
-	return claims
+	for _, ts := range a.TaskStates {
+		if ts == nil {
+			continue
+		}
+		if ts.Paused.Stop() {
+			return true
+		}
+	}
+	return false
 }
 
-// IdentityClaims are the input to a JWT identifying a workload. It
-// should never be serialized to msgpack unsigned.
-type IdentityClaims struct {
-	Namespace    string `json:"nomad_namespace"`
-	JobID        string `json:"nomad_job_id"`
-	AllocationID string `json:"nomad_allocation_id"`
-	TaskName     string `json:"nomad_task"`
-
-	jwt.RegisteredClaims
+// LastRescheduleFailed returns whether the scheduler previously attempted to
+// reschedule this allocation but failed to find a placement
+func (a *Allocation) LastRescheduleFailed() bool {
+	if a.RescheduleTracker == nil {
+		return false
+	}
+	return a.RescheduleTracker.LastReschedule != "" &&
+		a.RescheduleTracker.LastReschedule != LastRescheduleSuccess
 }
 
 // AllocationDiff is another named type for Allocation (to use the same fields),
@@ -11100,6 +11866,17 @@ func (a *AllocListStub) SetEventDisplayMessages() {
 	setDisplayMsg(a.TaskStates)
 }
 
+// RescheduleEligible returns if the allocation is eligible to be rescheduled according
+// to its ReschedulePolicy and the current state of its reschedule trackers
+func (a *AllocListStub) RescheduleEligible(reschedulePolicy *ReschedulePolicy, failTime time.Time) bool {
+	return a.RescheduleTracker.RescheduleEligible(reschedulePolicy, failTime)
+}
+
+// ClientTerminalStatus returns if the client status is terminal and will no longer transition
+func (a *AllocListStub) ClientTerminalStatus() bool {
+	return slices.Contains(terminalAllocationStatuses, a.ClientStatus)
+}
+
 func setDisplayMsg(taskStates map[string]*TaskState) {
 	for _, taskState := range taskStates {
 		for _, event := range taskState.Events {
@@ -11135,6 +11912,9 @@ type AllocMetric struct {
 
 	// NodesFiltered is the number of nodes filtered due to a constraint
 	NodesFiltered int
+
+	// NodesInPool is the number of nodes in the node pool used by the job.
+	NodesInPool int
 
 	// NodesAvailable is the number of nodes available for evaluation per DC.
 	NodesAvailable map[string]int
@@ -11367,6 +12147,7 @@ func (s *NodeScoreMeta) Data() interface{} {
 type AllocNetworkStatus struct {
 	InterfaceName string
 	Address       string
+	AddressIPv6   string
 	DNS           *DNSConfig
 }
 
@@ -11377,6 +12158,7 @@ func (a *AllocNetworkStatus) Copy() *AllocNetworkStatus {
 	return &AllocNetworkStatus{
 		InterfaceName: a.InterfaceName,
 		Address:       a.Address,
+		AddressIPv6:   a.AddressIPv6,
 		DNS:           a.DNS.Copy(),
 	}
 }
@@ -11396,6 +12178,8 @@ func (a *AllocNetworkStatus) Equal(o *AllocNetworkStatus) bool {
 	case a.InterfaceName != o.InterfaceName:
 		return false
 	case a.Address != o.Address:
+		return false
+	case a.AddressIPv6 != o.AddressIPv6:
 		return false
 	case !a.DNS.Equal(o.DNS):
 		return false
@@ -11721,6 +12505,7 @@ type Evaluation struct {
 	CreateIndex uint64
 	ModifyIndex uint64
 
+	// Creation and modification times stored as UnixNano
 	CreateTime int64
 	ModifyTime int64
 }
@@ -12694,8 +13479,8 @@ func (a *ACLToken) Copy() *ACLToken {
 }
 
 var (
-	// AnonymousACLToken is used no SecretID is provided, and the
-	// request is made anonymously.
+	// AnonymousACLToken is used when no SecretID is provided, and the request
+	// is made anonymously.
 	AnonymousACLToken = &ACLToken{
 		AccessorID: "anonymous",
 		Name:       "Anonymous Token",
@@ -12710,6 +13495,14 @@ var (
 		AccessorID: "leader",
 		Name:       "Leader Token",
 		Type:       ACLManagementToken,
+	}
+
+	// ACLsDisabledToken is used when ACLs are disabled.
+	ACLsDisabledToken = &ACLToken{
+		AccessorID: "acls-disabled",
+		Name:       "ACLs disabled token",
+		Type:       ACLClientToken,
+		Global:     false,
 	}
 )
 

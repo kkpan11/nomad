@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package exec
 
@@ -19,7 +19,9 @@ import (
 	"time"
 
 	"github.com/hashicorp/nomad/ci"
-	"github.com/hashicorp/nomad/client/lib/cgutil"
+	"github.com/hashicorp/nomad/client/allocdir"
+	"github.com/hashicorp/nomad/client/lib/cgroupslib"
+	"github.com/hashicorp/nomad/client/lib/numalib"
 	ctestutils "github.com/hashicorp/nomad/client/testutil"
 	"github.com/hashicorp/nomad/drivers/shared/executor"
 	"github.com/hashicorp/nomad/helper/pluginutils/hclutils"
@@ -27,16 +29,20 @@ import (
 	"github.com/hashicorp/nomad/helper/testtask"
 	"github.com/hashicorp/nomad/helper/uuid"
 	"github.com/hashicorp/nomad/nomad/structs"
-	basePlug "github.com/hashicorp/nomad/plugins/base"
+	"github.com/hashicorp/nomad/plugins/base"
 	"github.com/hashicorp/nomad/plugins/drivers"
 	dtestutil "github.com/hashicorp/nomad/plugins/drivers/testutils"
 	"github.com/hashicorp/nomad/testutil"
+	"github.com/shoenig/test/must"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 )
 
-const (
-	cgroupParent = "testing.slice"
-)
+type mockIDValidator struct{}
+
+func (mv *mockIDValidator) HasValidIDs(userName string) error {
+	return nil
+}
 
 func TestMain(m *testing.M) {
 	if !testtask.Run() {
@@ -61,14 +67,20 @@ func testResources(allocID, task string) *drivers.Resources {
 		LinuxResources: &drivers.LinuxResources{
 			MemoryLimitBytes: 134217728,
 			CPUShares:        100,
+			CpusetCgroupPath: cgroupslib.LinuxResourcesPath(allocID, task, false),
 		},
 	}
 
-	if cgutil.UseV2 {
-		r.LinuxResources.CpusetCgroupPath = filepath.Join(cgutil.CgroupRoot, cgroupParent, cgutil.CgroupScope(allocID, task))
-	}
-
 	return r
+}
+
+func newExecDriverTest(t *testing.T, ctx context.Context) drivers.DriverPlugin {
+	topology := numalib.Scan(numalib.PlatformScanners(false))
+	d := NewExecDriver(ctx, testlog.HCLogger(t))
+	d.(*Driver).nomadConfig = &base.ClientDriverConfig{Topology: topology}
+	d.(*Driver).userIDValidator = &mockIDValidator{}
+
+	return d
 }
 
 func TestExecDriver_Fingerprint_NonLinux(t *testing.T) {
@@ -81,7 +93,7 @@ func TestExecDriver_Fingerprint_NonLinux(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	d := NewExecDriver(ctx, testlog.HCLogger(t))
+	d := newExecDriverTest(t, ctx)
 	harness := dtestutil.NewDriverHarness(t, d)
 
 	fingerCh, err := harness.Fingerprint(context.Background())
@@ -103,7 +115,7 @@ func TestExecDriver_Fingerprint(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	d := NewExecDriver(ctx, testlog.HCLogger(t))
+	d := newExecDriverTest(t, ctx)
 	harness := dtestutil.NewDriverHarness(t, d)
 
 	fingerCh, err := harness.Fingerprint(context.Background())
@@ -117,6 +129,50 @@ func TestExecDriver_Fingerprint(t *testing.T) {
 	}
 }
 
+func TestExecDriver_WorkDir(t *testing.T) {
+	ci.Parallel(t)
+
+	ctestutils.ExecCompatible(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	d := newExecDriverTest(t, ctx)
+	harness := dtestutil.NewDriverHarness(t, d)
+	allocID := uuid.Generate()
+	task := &drivers.TaskConfig{
+		AllocID:   allocID,
+		ID:        uuid.Generate(),
+		Name:      "test",
+		Resources: testResources(allocID, "test"),
+	}
+
+	workDir := filepath.Join("/", allocdir.TaskLocal)
+	tc := &TaskConfig{
+		Command: "/bin/cat",
+		Args:    []string{"foo.txt"},
+		WorkDir: workDir,
+	}
+	must.NoError(t, task.EncodeConcreteDriverConfig(&tc))
+
+	cleanup := harness.MkAllocDir(task, false)
+	defer cleanup()
+
+	must.NoError(t, os.WriteFile(filepath.Join(task.TaskDir().Dir, allocdir.TaskLocal, "foo.txt"), []byte("foo"), 660))
+
+	handle, _, err := harness.StartTask(task)
+	must.NoError(t, err)
+
+	ch, err := harness.WaitTask(context.Background(), handle.Config.ID)
+	must.NoError(t, err)
+
+	// Task will fail if cat cannot find the file, which would only happen
+	// if the task's WorkDir was setup incorrectly
+	result := <-ch
+	must.Zero(t, result.ExitCode)
+	must.NoError(t, harness.DestroyTask(task.ID, true))
+}
+
 func TestExecDriver_StartWait(t *testing.T) {
 	ci.Parallel(t)
 	ctestutils.ExecCompatible(t)
@@ -124,9 +180,7 @@ func TestExecDriver_StartWait(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	logger := testlog.HCLogger(t)
-
-	d := NewExecDriver(ctx, logger)
+	d := newExecDriverTest(t, ctx)
 	harness := dtestutil.NewDriverHarness(t, d)
 	allocID := uuid.Generate()
 	task := &drivers.TaskConfig{
@@ -162,7 +216,7 @@ func TestExecDriver_StartWaitStopKill(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	d := NewExecDriver(ctx, testlog.HCLogger(t))
+	d := newExecDriverTest(t, ctx)
 	harness := dtestutil.NewDriverHarness(t, d)
 	allocID := uuid.Generate()
 	task := &drivers.TaskConfig{
@@ -227,7 +281,7 @@ func TestExecDriver_StartWaitRecover(t *testing.T) {
 	dCtx, dCancel := context.WithCancel(context.Background())
 	defer dCancel()
 
-	d := NewExecDriver(dCtx, testlog.HCLogger(t))
+	d := newExecDriverTest(t, dCtx)
 	harness := dtestutil.NewDriverHarness(t, d)
 	allocID := uuid.Generate()
 	task := &drivers.TaskConfig{
@@ -294,16 +348,14 @@ func TestExecDriver_StartWaitRecover(t *testing.T) {
 	require.NoError(t, harness.DestroyTask(task.ID, true))
 }
 
-// TestExecDriver_NoOrphans asserts that when the main
-// task dies, the orphans in the PID namespaces are killed by the kernel
-func TestExecDriver_NoOrphans(t *testing.T) {
+func TestExecDriver_NoOrphanedExecutor(t *testing.T) {
 	ci.Parallel(t)
 	ctestutils.ExecCompatible(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	d := NewExecDriver(ctx, testlog.HCLogger(t))
+	d := newExecDriverTest(t, ctx)
 	harness := dtestutil.NewDriverHarness(t, d)
 	defer harness.Kill()
 
@@ -314,19 +366,87 @@ func TestExecDriver_NoOrphans(t *testing.T) {
 	}
 
 	var data []byte
-	require.NoError(t, basePlug.MsgPackEncode(&data, config))
-	baseConfig := &basePlug.Config{PluginConfig: data}
+	must.NoError(t, base.MsgPackEncode(&data, config))
+	baseConfig := &base.Config{
+		PluginConfig: data,
+		AgentConfig: &base.AgentConfig{
+			Driver: &base.ClientDriverConfig{
+				Topology: d.(*Driver).nomadConfig.Topology,
+			},
+		},
+	}
+	must.NoError(t, harness.SetConfig(baseConfig))
+
+	allocID := uuid.Generate()
+	taskName := "test"
+	task := &drivers.TaskConfig{
+		AllocID:   allocID,
+		ID:        uuid.Generate(),
+		Name:      taskName,
+		Resources: testResources(allocID, taskName),
+	}
+
+	cleanup := harness.MkAllocDir(task, true)
+	defer cleanup()
+
+	taskConfig := map[string]interface{}{}
+	taskConfig["command"] = "force-an-error"
+	must.NoError(t, task.EncodeConcreteDriverConfig(&taskConfig))
+
+	_, _, err := harness.StartTask(task)
+	must.Error(t, err)
+	defer harness.DestroyTask(task.ID, true)
+
+	testPid := unix.Getpid()
+	tids, err := os.ReadDir(fmt.Sprintf("/proc/%d/task", testPid))
+	must.NoError(t, err)
+	for _, tid := range tids {
+		children, err := os.ReadFile(fmt.Sprintf("/proc/%d/task/%s/children", testPid, tid.Name()))
+		must.NoError(t, err)
+
+		pids := strings.Fields(string(children))
+		must.Eq(t, 0, len(pids))
+	}
+}
+
+// TestExecDriver_NoOrphans asserts that when the main
+// task dies, the orphans in the PID namespaces are killed by the kernel
+func TestExecDriver_NoOrphanedTasks(t *testing.T) {
+	ci.Parallel(t)
+	ctestutils.ExecCompatible(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	d := newExecDriverTest(t, ctx)
+	harness := dtestutil.NewDriverHarness(t, d)
+	defer harness.Kill()
+
+	config := &Config{
+		NoPivotRoot:    false,
+		DefaultModePID: executor.IsolationModePrivate,
+		DefaultModeIPC: executor.IsolationModePrivate,
+	}
+
+	var data []byte
+	require.NoError(t, base.MsgPackEncode(&data, config))
+	baseConfig := &base.Config{
+		PluginConfig: data,
+		AgentConfig: &base.AgentConfig{
+			Driver: &base.ClientDriverConfig{
+				Topology: d.(*Driver).nomadConfig.Topology,
+			},
+		},
+	}
 	require.NoError(t, harness.SetConfig(baseConfig))
 
 	allocID := uuid.Generate()
+	taskName := "test"
 	task := &drivers.TaskConfig{
-		AllocID: allocID,
-		ID:      uuid.Generate(),
-		Name:    "test",
-	}
-
-	if cgutil.UseV2 {
-		task.Resources = testResources(allocID, "test")
+		AllocID:   allocID,
+		ID:        uuid.Generate(),
+		Name:      taskName,
+		Resources: testResources(allocID, taskName),
 	}
 
 	cleanup := harness.MkAllocDir(task, true)
@@ -424,7 +544,7 @@ func TestExecDriver_Stats(t *testing.T) {
 	dctx, dcancel := context.WithCancel(context.Background())
 	defer dcancel()
 
-	d := NewExecDriver(dctx, testlog.HCLogger(t))
+	d := newExecDriverTest(t, dctx)
 	harness := dtestutil.NewDriverHarness(t, d)
 
 	allocID := uuid.Generate()
@@ -472,7 +592,7 @@ func TestExecDriver_Start_Wait_AllocDir(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	d := NewExecDriver(ctx, testlog.HCLogger(t))
+	d := newExecDriverTest(t, ctx)
 	harness := dtestutil.NewDriverHarness(t, d)
 	allocID := uuid.Generate()
 	task := &drivers.TaskConfig{
@@ -525,7 +645,7 @@ func TestExecDriver_User(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	d := NewExecDriver(ctx, testlog.HCLogger(t))
+	d := newExecDriverTest(t, ctx)
 	harness := dtestutil.NewDriverHarness(t, d)
 	allocID := uuid.Generate()
 	task := &drivers.TaskConfig{
@@ -563,7 +683,7 @@ func TestExecDriver_HandlerExec(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	d := NewExecDriver(ctx, testlog.HCLogger(t))
+	d := newExecDriverTest(t, ctx)
 	harness := dtestutil.NewDriverHarness(t, d)
 	allocID := uuid.Generate()
 	task := &drivers.TaskConfig{
@@ -590,7 +710,8 @@ func TestExecDriver_HandlerExec(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, res.ExitResult.Successful())
 	stdout := strings.TrimSpace(string(res.Stdout))
-	if !cgutil.UseV2 {
+	switch cgroupslib.GetMode() {
+	case cgroupslib.CG1:
 		for _, line := range strings.Split(stdout, "\n") {
 			// skip empty lines
 			if line == "" {
@@ -605,7 +726,7 @@ func TestExecDriver_HandlerExec(t *testing.T) {
 				t.Fatalf("not a member of the allocs nomad cgroup: %q", line)
 			}
 		}
-	} else {
+	default:
 		require.True(t, strings.HasSuffix(stdout, ".scope"), "actual stdout %q", stdout)
 	}
 
@@ -632,7 +753,7 @@ func TestExecDriver_DevicesAndMounts(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	d := NewExecDriver(ctx, testlog.HCLogger(t))
+	d := newExecDriverTest(t, ctx)
 	harness := dtestutil.NewDriverHarness(t, d)
 	allocID := uuid.Generate()
 	task := &drivers.TaskConfig{
@@ -721,11 +842,13 @@ func TestConfig_ParseAllHCL(t *testing.T) {
 config {
   command = "/bin/bash"
   args = ["-c", "echo hello"]
+  work_dir = "/root"
 }`
 
 	expected := &TaskConfig{
 		Command: "/bin/bash",
 		Args:    []string{"-c", "echo hello"},
+		WorkDir: "/root",
 	}
 
 	var tc *TaskConfig
@@ -740,7 +863,7 @@ func TestExecDriver_NoPivotRoot(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	d := NewExecDriver(ctx, testlog.HCLogger(t))
+	d := newExecDriverTest(t, ctx)
 	harness := dtestutil.NewDriverHarness(t, d)
 
 	config := &Config{
@@ -750,8 +873,15 @@ func TestExecDriver_NoPivotRoot(t *testing.T) {
 	}
 
 	var data []byte
-	require.NoError(t, basePlug.MsgPackEncode(&data, config))
-	bconfig := &basePlug.Config{PluginConfig: data}
+	require.NoError(t, base.MsgPackEncode(&data, config))
+	bconfig := &base.Config{
+		PluginConfig: data,
+		AgentConfig: &base.AgentConfig{
+			Driver: &base.ClientDriverConfig{
+				Topology: d.(*Driver).nomadConfig.Topology,
+			},
+		},
+	}
 	require.NoError(t, harness.SetConfig(bconfig))
 
 	allocID := uuid.Generate()
@@ -774,6 +904,123 @@ func TestExecDriver_NoPivotRoot(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, handle)
 	require.NoError(t, harness.DestroyTask(task.ID, true))
+}
+
+func TestExecDriver_OOMKilled(t *testing.T) {
+	ci.Parallel(t)
+	ctestutils.ExecCompatible(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	d := newExecDriverTest(t, ctx)
+	harness := dtestutil.NewDriverHarness(t, d)
+	allocID := uuid.Generate()
+	name := "oom-killed"
+	task := &drivers.TaskConfig{
+		AllocID:   allocID,
+		ID:        uuid.Generate(),
+		Name:      name,
+		Resources: testResources(allocID, name),
+	}
+	task.Resources.LinuxResources.MemoryLimitBytes = 10 * 1024 * 1024
+	task.Resources.NomadResources.Memory.MemoryMB = 10
+
+	tc := &TaskConfig{
+		Command: "/bin/tail",
+		Args:    []string{"/dev/zero"},
+	}
+	must.NoError(t, task.EncodeConcreteDriverConfig(&tc))
+
+	cleanup := harness.MkAllocDir(task, false)
+	defer cleanup()
+
+	handle, _, err := harness.StartTask(task)
+	must.NoError(t, err)
+
+	ch, err := harness.WaitTask(context.Background(), handle.Config.ID)
+	must.NoError(t, err)
+	result := <-ch
+	must.False(t, result.Successful(), must.Sprint("container should OOM"))
+	must.True(t, result.OOMKilled, must.Sprintf("got non-OOM error, code: %d, err: %v", result.ExitCode, result.Err))
+
+	t.Logf("Successfully killed by OOM killer")
+	must.NoError(t, harness.DestroyTask(task.ID, true))
+}
+
+func TestDriver_Config_setDeniedIds(t *testing.T) {
+
+	ci.Parallel(t)
+
+	testCases := []struct {
+		name      string
+		uidRanges string
+		gidRanges string
+		exError   bool
+	}{
+		{
+			name:      "empty_ranges",
+			uidRanges: "",
+			gidRanges: "",
+			exError:   false,
+		},
+		{
+			name:      "valid_ranges",
+			uidRanges: "1-10",
+			gidRanges: "1-10",
+			exError:   false,
+		},
+		{
+			name:      "empty_GID_invalid_UID_range",
+			uidRanges: "10-1",
+			gidRanges: "",
+			exError:   true,
+		},
+		{
+			name:      "empty_UID_invalid_GID_range",
+			uidRanges: "",
+			gidRanges: "10-1",
+			exError:   true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			d := newExecDriverTest(t, ctx)
+
+			// Force the creation of the validatior.
+			d.(*Driver).userIDValidator = nil
+
+			harness := dtestutil.NewDriverHarness(t, d)
+			defer harness.Kill()
+
+			config := &Config{
+				NoPivotRoot:    false,
+				DefaultModePID: executor.IsolationModePrivate,
+				DefaultModeIPC: executor.IsolationModePrivate,
+				DeniedHostUids: tc.uidRanges,
+				DeniedHostGids: tc.gidRanges,
+			}
+
+			var data []byte
+			must.NoError(t, base.MsgPackEncode(&data, config))
+
+			baseConfig := &base.Config{
+				PluginConfig: data,
+				AgentConfig: &base.AgentConfig{
+					Driver: &base.ClientDriverConfig{
+						Topology: d.(*Driver).nomadConfig.Topology,
+					},
+				},
+			}
+
+			err := harness.SetConfig(baseConfig)
+			must.Eq(t, err != nil, tc.exError)
+		})
+	}
 }
 
 func TestDriver_Config_validate(t *testing.T) {
@@ -819,6 +1066,7 @@ func TestDriver_Config_validate(t *testing.T) {
 
 func TestDriver_TaskConfig_validate(t *testing.T) {
 	ci.Parallel(t)
+
 	t.Run("pid/ipc", func(t *testing.T) {
 		for _, tc := range []struct {
 			pidMode, ipcMode string
@@ -834,7 +1082,7 @@ func TestDriver_TaskConfig_validate(t *testing.T) {
 			{pidMode: "", ipcMode: "host", exp: nil},
 			{pidMode: "other", ipcMode: "host", exp: errors.New(`pid_mode must be "private" or "host", got "other"`)},
 		} {
-			require.Equal(t, tc.exp, (&TaskConfig{
+			must.Eq(t, tc.exp, (&TaskConfig{
 				ModePID: tc.pidMode,
 				ModeIPC: tc.ipcMode,
 			}).validate())
@@ -852,7 +1100,7 @@ func TestDriver_TaskConfig_validate(t *testing.T) {
 			{adds: []string{"chown", "sys_time"}, exp: nil},
 			{adds: []string{"chown", "not_valid", "sys_time"}, exp: errors.New("cap_add configured with capabilities not supported by system: not_valid")},
 		} {
-			require.Equal(t, tc.exp, (&TaskConfig{
+			must.Eq(t, tc.exp, (&TaskConfig{
 				CapAdd: tc.adds,
 			}).validate())
 		}
@@ -869,8 +1117,22 @@ func TestDriver_TaskConfig_validate(t *testing.T) {
 			{drops: []string{"chown", "sys_time"}, exp: nil},
 			{drops: []string{"chown", "not_valid", "sys_time"}, exp: errors.New("cap_drop configured with capabilities not supported by system: not_valid")},
 		} {
-			require.Equal(t, tc.exp, (&TaskConfig{
+			must.Eq(t, tc.exp, (&TaskConfig{
 				CapDrop: tc.drops,
+			}).validate())
+		}
+	})
+
+	t.Run("work_dir", func(t *testing.T) {
+		for _, tc := range []struct {
+			workDir string
+			exp     error
+		}{
+			{workDir: "/foo", exp: nil},
+			{workDir: "foo", exp: errors.New(`work_dir must be absolute but got relative path "foo"`)},
+		} {
+			must.Eq(t, tc.exp, (&TaskConfig{
+				WorkDir: tc.workDir,
 			}).validate())
 		}
 	})

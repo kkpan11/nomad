@@ -1,6 +1,6 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 import Route from '@ember/routing/route';
@@ -50,6 +50,9 @@ export default class AllocationRoute extends Route.extend(WithWatchers) {
         super.model(...arguments),
         this.store.findAll('namespace'),
       ]);
+      if (allocation.isPartial) {
+        await allocation.reload();
+      }
       const jobId = allocation.belongsTo('job').id();
       await this.store.findRecord('job', jobId);
       return allocation;

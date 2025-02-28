@@ -1,6 +1,6 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 import EmberRouter from '@ember/routing/router';
@@ -38,6 +38,7 @@ Router.map(function () {
       this.route('services', function () {
         this.route('service', { path: '/:name' });
       });
+      this.route('variables');
     });
   });
 
@@ -86,6 +87,7 @@ Router.map(function () {
 
   this.route('settings', function () {
     this.route('tokens');
+    this.route('user-settings');
   });
 
   // if we don't include function() the outlet won't render
@@ -110,11 +112,37 @@ Router.map(function () {
     });
   });
 
-  this.route('policies', function () {
-    this.route('new');
-
-    this.route('policy', {
-      path: '/:name',
+  this.route('administration', function () {
+    this.route('policies', function () {
+      this.route('new');
+      this.route('policy', {
+        path: '/:name',
+      });
+    });
+    this.route('roles', function () {
+      this.route('new');
+      this.route('role', {
+        path: '/:id',
+      });
+    });
+    this.route('tokens', function () {
+      this.route('new');
+      this.route('token', {
+        path: '/:id',
+      });
+    });
+    this.route('namespaces', function () {
+      this.route('new');
+      // Note, this needs the "acl-" portion due to
+      // "namespace" being a magic string in Ember
+      this.route('acl-namespace', {
+        path: '/:name',
+      });
+    });
+    this.route('sentinel-policies', function () {
+      this.route('new');
+      this.route('gallery');
+      this.route('policy', { path: '/:id' });
     });
   });
   // Mirage-only route for testing OIDC flow

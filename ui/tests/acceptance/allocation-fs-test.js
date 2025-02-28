@@ -1,6 +1,6 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 /* eslint-disable ember-a11y-testing/a11y-audit-called */ // Covered in behaviours/fs
@@ -20,6 +20,7 @@ module('Acceptance | allocation fs', function (hooks) {
 
   hooks.beforeEach(async function () {
     server.create('agent');
+    server.create('node-pool');
     server.create('node', 'forceIPv4');
     const job = server.create('job', { createAllocations: false });
 

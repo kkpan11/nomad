@@ -1,5 +1,5 @@
 # Copyright (c) HashiCorp, Inc.
-# SPDX-License-Identifier: MPL-2.0
+# SPDX-License-Identifier: BUSL-1.1
 
 # jobspec for running CSI plugin for AWS EBS, derived from
 # the kubernetes manifests found at
@@ -22,7 +22,7 @@ job "plugin-aws-ebs-nodes" {
       driver = "docker"
 
       config {
-        image = "public.ecr.aws/ebs-csi-driver/aws-ebs-csi-driver:v1.5.1"
+        image = "public.ecr.aws/ebs-csi-driver/aws-ebs-csi-driver:v1.33.0"
 
         args = [
           "node",

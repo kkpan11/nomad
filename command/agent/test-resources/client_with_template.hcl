@@ -1,5 +1,5 @@
 # Copyright (c) HashiCorp, Inc.
-# SPDX-License-Identifier: MPL-2.0
+# SPDX-License-Identifier: BUSL-1.1
 
 client {
   enabled = true
@@ -25,13 +25,13 @@ client {
     }
 
     vault_retry {
-      attempts    = 10
+      attempts    = 0 // unlimited
       backoff     = "15s"
       max_backoff = "20s"
     }
 
     nomad_retry {
-      attempts    = 15
+      // unset attempts=12, should fallback to default
       backoff     = "20s"
       max_backoff = "25s"
     }

@@ -1,6 +1,6 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 .service-list {
@@ -118,6 +118,9 @@ table.health-checks {
           border-radius: 2px;
           &.status-success {
             background-color: $nomad-green;
+          }
+          &.status-pending {
+            background-color: $gray-300;
           }
           &.status-failure {
             background-color: $red;

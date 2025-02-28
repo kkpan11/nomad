@@ -1,6 +1,6 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 import Component from '@ember/component';
@@ -19,7 +19,9 @@ export default class JobVersionsStream extends Component {
   // Passes through to the job-diff component
   verbose = true;
 
-  @computed('versions.[]')
+  diffs = [];
+
+  @computed('versions.[]', 'diffs.[]')
   get annotatedVersions() {
     const versions = this.versions.sortBy('submitTime').reverse();
     return versions.map((version, index) => {
@@ -38,7 +40,8 @@ export default class JobVersionsStream extends Component {
         }
       }
 
-      return { version, meta };
+      const diff = this.diffs.objectAt(index);
+      return { version, meta, diff };
     });
   }
 }

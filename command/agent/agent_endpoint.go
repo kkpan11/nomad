@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package agent
 
@@ -18,7 +18,7 @@ import (
 
 	"github.com/docker/docker/pkg/ioutils"
 	log "github.com/hashicorp/go-hclog"
-	"github.com/hashicorp/go-msgpack/codec"
+	"github.com/hashicorp/go-msgpack/v2/codec"
 	"github.com/hashicorp/nomad/api"
 	cstructs "github.com/hashicorp/nomad/client/structs"
 	"github.com/hashicorp/nomad/command/agent/host"
@@ -59,7 +59,7 @@ func nomadMember(m serf.Member) Member {
 }
 
 func (s *HTTPServer) AgentSelfRequest(resp http.ResponseWriter, req *http.Request) (interface{}, error) {
-	if req.Method != "GET" {
+	if req.Method != http.MethodGet {
 		return nil, CodedError(405, ErrInvalidMethod)
 	}
 
@@ -67,9 +67,7 @@ func (s *HTTPServer) AgentSelfRequest(resp http.ResponseWriter, req *http.Reques
 	if err != nil {
 		return nil, err
 	}
-
-	// Check agent read permissions
-	if aclObj != nil && !aclObj.AllowAgentRead() {
+	if !aclObj.AllowAgentRead() {
 		return nil, structs.ErrPermissionDenied
 	}
 
@@ -86,16 +84,14 @@ func (s *HTTPServer) AgentSelfRequest(resp http.ResponseWriter, req *http.Reques
 
 	self.Config = s.agent.GetConfig().Copy()
 
-	if self.Config != nil && self.Config.Vault != nil && self.Config.Vault.Token != "" {
-		self.Config.Vault.Token = "<redacted>"
-	}
-
 	if self.Config != nil && self.Config.ACL != nil && self.Config.ACL.ReplicationToken != "" {
 		self.Config.ACL.ReplicationToken = "<redacted>"
 	}
 
-	if self.Config != nil && self.Config.Consul != nil && self.Config.Consul.Token != "" {
-		self.Config.Consul.Token = "<redacted>"
+	for _, consulConfig := range self.Config.Consuls {
+		if consulConfig.Token != "" {
+			consulConfig.Token = "<redacted>"
+		}
 	}
 
 	if self.Config != nil && self.Config.Telemetry != nil && self.Config.Telemetry.CirconusAPIToken != "" {
@@ -106,7 +102,7 @@ func (s *HTTPServer) AgentSelfRequest(resp http.ResponseWriter, req *http.Reques
 }
 
 func (s *HTTPServer) AgentJoinRequest(resp http.ResponseWriter, req *http.Request) (interface{}, error) {
-	if req.Method != "PUT" && req.Method != "POST" {
+	if req.Method != http.MethodPut && req.Method != http.MethodPost {
 		return nil, CodedError(405, ErrInvalidMethod)
 	}
 	srv := s.agent.Server()
@@ -131,7 +127,7 @@ func (s *HTTPServer) AgentJoinRequest(resp http.ResponseWriter, req *http.Reques
 }
 
 func (s *HTTPServer) AgentMembersRequest(resp http.ResponseWriter, req *http.Request) (interface{}, error) {
-	if req.Method != "GET" {
+	if req.Method != http.MethodGet {
 		return nil, CodedError(405, ErrInvalidMethod)
 	}
 
@@ -179,14 +175,26 @@ func (s *HTTPServer) AgentMonitor(resp http.ResponseWriter, req *http.Request) (
 		plainText = parsed
 	}
 
+	logIncludeLocation := false
+	logIncludeLocationStr := req.URL.Query().Get("log_include_location")
+	if logIncludeLocationStr != "" {
+		parsed, err := strconv.ParseBool(logIncludeLocationStr)
+		if err != nil {
+			return nil, CodedError(http.StatusBadRequest,
+				fmt.Sprintf("Unknown option for log_include_location: %v", err))
+		}
+		logIncludeLocation = parsed
+	}
+
 	nodeID := req.URL.Query().Get("node_id")
 	// Build the request and parse the ACL token
 	args := cstructs.MonitorRequest{
-		NodeID:    nodeID,
-		ServerID:  req.URL.Query().Get("server_id"),
-		LogLevel:  logLevel,
-		LogJSON:   logJSON,
-		PlainText: plainText,
+		NodeID:             nodeID,
+		ServerID:           req.URL.Query().Get("server_id"),
+		LogLevel:           logLevel,
+		LogJSON:            logJSON,
+		LogIncludeLocation: logIncludeLocation,
+		PlainText:          plainText,
 	}
 
 	// if node and server were requested return error
@@ -298,7 +306,7 @@ func (s *HTTPServer) AgentMonitor(resp http.ResponseWriter, req *http.Request) (
 }
 
 func (s *HTTPServer) AgentForceLeaveRequest(resp http.ResponseWriter, req *http.Request) (interface{}, error) {
-	if req.Method != "PUT" && req.Method != "POST" {
+	if req.Method != http.MethodPut && req.Method != http.MethodPost {
 		return nil, CodedError(405, ErrInvalidMethod)
 	}
 	srv := s.agent.Server()
@@ -312,7 +320,7 @@ func (s *HTTPServer) AgentForceLeaveRequest(resp http.ResponseWriter, req *http.
 	// Check agent write permissions
 	if aclObj, err := s.agent.Server().ResolveToken(secret); err != nil {
 		return nil, err
-	} else if aclObj != nil && !aclObj.AllowAgentWrite() {
+	} else if !aclObj.AllowAgentWrite() {
 		return nil, structs.ErrPermissionDenied
 	}
 
@@ -322,8 +330,17 @@ func (s *HTTPServer) AgentForceLeaveRequest(resp http.ResponseWriter, req *http.
 		return nil, CodedError(400, "missing node to force leave")
 	}
 
+	prune, err := parseBool(req, "prune")
+	if err != nil {
+		return nil, CodedError(400, "invalid prune value")
+	}
+
 	// Attempt remove
-	err := srv.RemoveFailedNode(node)
+	if prune != nil && *prune {
+		err = srv.RemoveFailedNodePrune(node)
+	} else {
+		err = srv.RemoveFailedNode(node)
+	}
 	return nil, err
 }
 
@@ -418,9 +435,9 @@ func (s *HTTPServer) agentPprof(reqType pprof.ReqType, resp http.ResponseWriter,
 // servers for a given agent.
 func (s *HTTPServer) AgentServersRequest(resp http.ResponseWriter, req *http.Request) (interface{}, error) {
 	switch req.Method {
-	case "PUT", "POST":
+	case http.MethodPut, http.MethodPost:
 		return s.updateServers(resp, req)
-	case "GET":
+	case http.MethodGet:
 		return s.listServers(resp, req)
 	default:
 		return nil, CodedError(405, ErrInvalidMethod)
@@ -439,7 +456,7 @@ func (s *HTTPServer) listServers(resp http.ResponseWriter, req *http.Request) (i
 	// Check agent read permissions
 	if aclObj, err := s.agent.Client().ResolveToken(secret); err != nil {
 		return nil, err
-	} else if aclObj != nil && !aclObj.AllowAgentRead() {
+	} else if !aclObj.AllowAgentRead() {
 		return nil, structs.ErrPermissionDenied
 	}
 
@@ -466,7 +483,7 @@ func (s *HTTPServer) updateServers(resp http.ResponseWriter, req *http.Request) 
 	// Check agent write permissions
 	if aclObj, err := s.agent.Client().ResolveToken(secret); err != nil {
 		return nil, err
-	} else if aclObj != nil && !aclObj.AllowAgentWrite() {
+	} else if !aclObj.AllowAgentWrite() {
 		return nil, structs.ErrPermissionDenied
 	}
 
@@ -493,7 +510,7 @@ func (s *HTTPServer) KeyringOperationRequest(resp http.ResponseWriter, req *http
 	// Check agent write permissions
 	if aclObj, err := srv.ResolveToken(secret); err != nil {
 		return nil, err
-	} else if aclObj != nil && !aclObj.AllowAgentWrite() {
+	} else if !aclObj.AllowAgentWrite() {
 		return nil, structs.ErrPermissionDenied
 	}
 
@@ -552,7 +569,7 @@ type joinResult struct {
 }
 
 func (s *HTTPServer) HealthRequest(resp http.ResponseWriter, req *http.Request) (interface{}, error) {
-	if req.Method != "GET" {
+	if req.Method != http.MethodGet {
 		return nil, CodedError(405, ErrInvalidMethod)
 	}
 
@@ -671,8 +688,7 @@ func (s *HTTPServer) AgentHostRequest(resp http.ResponseWriter, req *http.Reques
 		enableDebug = s.agent.Client().GetConfig().EnableDebug
 	}
 
-	if (aclObj != nil && !aclObj.AllowAgentRead()) ||
-		(aclObj == nil && !enableDebug) {
+	if !aclObj.AllowAgentDebug(enableDebug) {
 		return nil, structs.ErrPermissionDenied
 	}
 
@@ -744,7 +760,7 @@ func (s *HTTPServer) AgentSchedulerWorkerInfoRequest(resp http.ResponseWriter, r
 	// Check agent read permissions
 	if aclObj, err := s.agent.Server().ResolveToken(secret); err != nil {
 		return nil, CodedError(http.StatusInternalServerError, err.Error())
-	} else if aclObj != nil && !aclObj.AllowAgentRead() {
+	} else if !aclObj.AllowAgentRead() {
 		return nil, CodedError(http.StatusForbidden, structs.ErrPermissionDenied.Error())
 	}
 
@@ -798,7 +814,7 @@ func (s *HTTPServer) getScheduleWorkersConfig(resp http.ResponseWriter, req *htt
 	// Check agent read permissions
 	if aclObj, err := s.agent.Server().ResolveToken(secret); err != nil {
 		return nil, CodedError(http.StatusInternalServerError, err.Error())
-	} else if aclObj != nil && !aclObj.AllowAgentRead() {
+	} else if !aclObj.AllowAgentRead() {
 		return nil, CodedError(http.StatusForbidden, structs.ErrPermissionDenied.Error())
 	}
 
@@ -824,7 +840,7 @@ func (s *HTTPServer) updateScheduleWorkersConfig(resp http.ResponseWriter, req *
 	// Check agent write permissions
 	if aclObj, err := srv.ResolveToken(secret); err != nil {
 		return nil, CodedError(http.StatusInternalServerError, err.Error())
-	} else if aclObj != nil && !aclObj.AllowAgentWrite() {
+	} else if !aclObj.AllowAgentWrite() {
 		return nil, CodedError(http.StatusForbidden, structs.ErrPermissionDenied.Error())
 	}
 

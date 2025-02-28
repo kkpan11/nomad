@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package scheduler
 
@@ -7,9 +7,13 @@ import (
 	"sort"
 	"testing"
 
+	"github.com/hashicorp/nomad/client/lib/idset"
+	"github.com/hashicorp/nomad/client/lib/numalib"
+	"github.com/hashicorp/nomad/client/lib/numalib/hw"
 	"github.com/hashicorp/nomad/helper/uuid"
 	"github.com/hashicorp/nomad/nomad/mock"
 	"github.com/hashicorp/nomad/nomad/structs"
+	"github.com/shoenig/test/must"
 	"github.com/stretchr/testify/require"
 )
 
@@ -34,16 +38,22 @@ func TestFeasibleRankIterator(t *testing.T) {
 	}
 }
 
+var (
+	legacyCpuResources1024, processorResources1024 = cpuResources(1024)
+	legacyCpuResources2048, processorResources2048 = cpuResources(2048)
+	legacyCpuResources4096, processorResources4096 = cpuResources(4096)
+)
+
 func TestBinPackIterator_NoExistingAlloc(t *testing.T) {
 	_, ctx := testContext(t)
+
 	nodes := []*RankedNode{
 		{
 			Node: &structs.Node{
 				// Perfect fit
 				NodeResources: &structs.NodeResources{
-					Cpu: structs.NodeCpuResources{
-						CpuShares: 2048,
-					},
+					Processors: processorResources2048,
+					Cpu:        legacyCpuResources2048,
 					Memory: structs.NodeMemoryResources{
 						MemoryMB: 2048,
 					},
@@ -62,9 +72,8 @@ func TestBinPackIterator_NoExistingAlloc(t *testing.T) {
 			Node: &structs.Node{
 				// Overloaded
 				NodeResources: &structs.NodeResources{
-					Cpu: structs.NodeCpuResources{
-						CpuShares: 1024,
-					},
+					Processors: processorResources1024,
+					Cpu:        legacyCpuResources1024,
 					Memory: structs.NodeMemoryResources{
 						MemoryMB: 1024,
 					},
@@ -83,9 +92,8 @@ func TestBinPackIterator_NoExistingAlloc(t *testing.T) {
 			Node: &structs.Node{
 				// 50% fit
 				NodeResources: &structs.NodeResources{
-					Cpu: structs.NodeCpuResources{
-						CpuShares: 4096,
-					},
+					Processors: processorResources4096,
+					Cpu:        legacyCpuResources4096,
 					Memory: structs.NodeMemoryResources{
 						MemoryMB: 4096,
 					},
@@ -115,8 +123,9 @@ func TestBinPackIterator_NoExistingAlloc(t *testing.T) {
 			},
 		},
 	}
-	binp := NewBinPackIterator(ctx, static, false, 0, testSchedulerConfig)
+	binp := NewBinPackIterator(ctx, static, false, 0)
 	binp.SetTaskGroup(taskGroup)
+	binp.SetSchedulerConfiguration(testSchedulerConfig)
 
 	scoreNorm := NewScoreNormalizationIterator(ctx, binp)
 
@@ -141,15 +150,19 @@ func TestBinPackIterator_NoExistingAlloc(t *testing.T) {
 // resources.
 func TestBinPackIterator_NoExistingAlloc_MixedReserve(t *testing.T) {
 	_, ctx := testContext(t)
+
+	legacyCpuResources900, processorResources900 := cpuResources(900)
+	legacyCpuResources1100, processorResources1100 := cpuResources(1100)
+	legacyCpuResources2000, processorResources2000 := cpuResources(2000)
+
 	nodes := []*RankedNode{
 		{
 			// Best fit
 			Node: &structs.Node{
 				Name: "no-reserved",
 				NodeResources: &structs.NodeResources{
-					Cpu: structs.NodeCpuResources{
-						CpuShares: 1100,
-					},
+					Processors: processorResources1100,
+					Cpu:        legacyCpuResources1100,
 					Memory: structs.NodeMemoryResources{
 						MemoryMB: 1100,
 					},
@@ -161,9 +174,8 @@ func TestBinPackIterator_NoExistingAlloc_MixedReserve(t *testing.T) {
 			Node: &structs.Node{
 				Name: "reserved",
 				NodeResources: &structs.NodeResources{
-					Cpu: structs.NodeCpuResources{
-						CpuShares: 2000,
-					},
+					Processors: processorResources2000,
+					Cpu:        legacyCpuResources2000,
 					Memory: structs.NodeMemoryResources{
 						MemoryMB: 2000,
 					},
@@ -183,9 +195,8 @@ func TestBinPackIterator_NoExistingAlloc_MixedReserve(t *testing.T) {
 			Node: &structs.Node{
 				Name: "reserved2",
 				NodeResources: &structs.NodeResources{
-					Cpu: structs.NodeCpuResources{
-						CpuShares: 2000,
-					},
+					Processors: processorResources2000,
+					Cpu:        legacyCpuResources2000,
 					Memory: structs.NodeMemoryResources{
 						MemoryMB: 2000,
 					},
@@ -204,9 +215,8 @@ func TestBinPackIterator_NoExistingAlloc_MixedReserve(t *testing.T) {
 			Node: &structs.Node{
 				Name: "overloaded",
 				NodeResources: &structs.NodeResources{
-					Cpu: structs.NodeCpuResources{
-						CpuShares: 900,
-					},
+					Processors: processorResources900,
+					Cpu:        legacyCpuResources900,
 					Memory: structs.NodeMemoryResources{
 						MemoryMB: 900,
 					},
@@ -228,8 +238,9 @@ func TestBinPackIterator_NoExistingAlloc_MixedReserve(t *testing.T) {
 			},
 		},
 	}
-	binp := NewBinPackIterator(ctx, static, false, 0, testSchedulerConfig)
+	binp := NewBinPackIterator(ctx, static, false, 0)
 	binp.SetTaskGroup(taskGroup)
+	binp.SetSchedulerConfiguration(testSchedulerConfig)
 
 	scoreNorm := NewScoreNormalizationIterator(ctx, binp)
 
@@ -261,9 +272,8 @@ func TestBinPackIterator_Network_Success(t *testing.T) {
 			Node: &structs.Node{
 				// Perfect fit
 				NodeResources: &structs.NodeResources{
-					Cpu: structs.NodeCpuResources{
-						CpuShares: 2048,
-					},
+					Processors: processorResources2048,
+					Cpu:        legacyCpuResources2048,
 					Memory: structs.NodeMemoryResources{
 						MemoryMB: 2048,
 					},
@@ -293,9 +303,8 @@ func TestBinPackIterator_Network_Success(t *testing.T) {
 			Node: &structs.Node{
 				// 50% fit
 				NodeResources: &structs.NodeResources{
-					Cpu: structs.NodeCpuResources{
-						CpuShares: 4096,
-					},
+					Processors: processorResources4096,
+					Cpu:        legacyCpuResources4096,
 					Memory: structs.NodeMemoryResources{
 						MemoryMB: 4096,
 					},
@@ -349,8 +358,9 @@ func TestBinPackIterator_Network_Success(t *testing.T) {
 			},
 		},
 	}
-	binp := NewBinPackIterator(ctx, static, false, 0, testSchedulerConfig)
+	binp := NewBinPackIterator(ctx, static, false, 0)
 	binp.SetTaskGroup(taskGroup)
+	binp.SetSchedulerConfiguration(testSchedulerConfig)
 
 	scoreNorm := NewScoreNormalizationIterator(ctx, binp)
 
@@ -389,9 +399,8 @@ func TestBinPackIterator_Network_Failure(t *testing.T) {
 			Node: &structs.Node{
 				// 50% fit
 				NodeResources: &structs.NodeResources{
-					Cpu: structs.NodeCpuResources{
-						CpuShares: 4096,
-					},
+					Processors: processorResources4096,
+					Cpu:        legacyCpuResources4096,
 					Memory: structs.NodeMemoryResources{
 						MemoryMB: 4096,
 					},
@@ -481,8 +490,9 @@ func TestBinPackIterator_Network_Failure(t *testing.T) {
 		},
 	}
 
-	binp := NewBinPackIterator(ctx, static, false, 0, testSchedulerConfig)
+	binp := NewBinPackIterator(ctx, static, false, 0)
 	binp.SetTaskGroup(taskGroup)
+	binp.SetSchedulerConfiguration(testSchedulerConfig)
 
 	scoreNorm := NewScoreNormalizationIterator(ctx, binp)
 
@@ -516,9 +526,8 @@ func TestBinPackIterator_Network_NoCollision_Node(t *testing.T) {
 					},
 				},
 				NodeResources: &structs.NodeResources{
-					Cpu: structs.NodeCpuResources{
-						CpuShares: 4096,
-					},
+					Processors: processorResources4096,
+					Cpu:        legacyCpuResources4096,
 					Memory: structs.NodeMemoryResources{
 						MemoryMB: 4096,
 					},
@@ -575,8 +584,9 @@ func TestBinPackIterator_Network_NoCollision_Node(t *testing.T) {
 			},
 		},
 	}
-	binp := NewBinPackIterator(ctx, static, false, 0, testSchedulerConfig)
+	binp := NewBinPackIterator(ctx, static, false, 0)
 	binp.SetTaskGroup(taskGroup)
+	binp.SetSchedulerConfiguration(testSchedulerConfig)
 
 	scoreNorm := NewScoreNormalizationIterator(ctx, binp)
 	out := collectRanked(scoreNorm)
@@ -610,9 +620,8 @@ func TestBinPackIterator_Network_NodeError(t *testing.T) {
 					},
 				},
 				NodeResources: &structs.NodeResources{
-					Cpu: structs.NodeCpuResources{
-						CpuShares: 4096,
-					},
+					Processors: processorResources4096,
+					Cpu:        legacyCpuResources4096,
 					Memory: structs.NodeMemoryResources{
 						MemoryMB: 4096,
 					},
@@ -674,8 +683,9 @@ func TestBinPackIterator_Network_NodeError(t *testing.T) {
 			},
 		},
 	}
-	binp := NewBinPackIterator(ctx, static, false, 0, testSchedulerConfig)
+	binp := NewBinPackIterator(ctx, static, false, 0)
 	binp.SetTaskGroup(taskGroup)
+	binp.SetSchedulerConfiguration(testSchedulerConfig)
 
 	scoreNorm := NewScoreNormalizationIterator(ctx, binp)
 	out := collectRanked(scoreNorm)
@@ -697,9 +707,8 @@ func TestBinPackIterator_Network_PortCollision_Alloc(t *testing.T) {
 			Node: &structs.Node{
 				ID: uuid.Generate(),
 				NodeResources: &structs.NodeResources{
-					Cpu: structs.NodeCpuResources{
-						CpuShares: 2048,
-					},
+					Processors: processorResources2048,
+					Cpu:        legacyCpuResources2048,
 					Memory: structs.NodeMemoryResources{
 						MemoryMB: 2048,
 					},
@@ -801,8 +810,9 @@ func TestBinPackIterator_Network_PortCollision_Alloc(t *testing.T) {
 			},
 		},
 	}
-	binp := NewBinPackIterator(ctx, static, false, 0, testSchedulerConfig)
+	binp := NewBinPackIterator(ctx, static, false, 0)
 	binp.SetTaskGroup(taskGroup)
+	binp.SetSchedulerConfiguration(testSchedulerConfig)
 
 	scoreNorm := NewScoreNormalizationIterator(ctx, binp)
 	out := collectRanked(scoreNorm)
@@ -823,9 +833,8 @@ func TestBinPackIterator_Network_Interpolation_Success(t *testing.T) {
 					"some_network": "public",
 				},
 				NodeResources: &structs.NodeResources{
-					Cpu: structs.NodeCpuResources{
-						CpuShares: 2048,
-					},
+					Processors: processorResources2048,
+					Cpu:        legacyCpuResources2048,
 					Memory: structs.NodeMemoryResources{
 						MemoryMB: 2048,
 					},
@@ -870,9 +879,8 @@ func TestBinPackIterator_Network_Interpolation_Success(t *testing.T) {
 					"some_network": "second",
 				},
 				NodeResources: &structs.NodeResources{
-					Cpu: structs.NodeCpuResources{
-						CpuShares: 4096,
-					},
+					Processors: processorResources4096,
+					Cpu:        legacyCpuResources4096,
 					Memory: structs.NodeMemoryResources{
 						MemoryMB: 4096,
 					},
@@ -944,8 +952,9 @@ func TestBinPackIterator_Network_Interpolation_Success(t *testing.T) {
 			},
 		},
 	}
-	binp := NewBinPackIterator(ctx, static, false, 0, testSchedulerConfig)
+	binp := NewBinPackIterator(ctx, static, false, 0)
 	binp.SetTaskGroup(taskGroup)
+	binp.SetSchedulerConfiguration(testSchedulerConfig)
 
 	scoreNorm := NewScoreNormalizationIterator(ctx, binp)
 
@@ -976,9 +985,8 @@ func TestBinPackIterator_Host_Network_Interpolation_Absent_Value(t *testing.T) {
 					"some_network": "public",
 				},
 				NodeResources: &structs.NodeResources{
-					Cpu: structs.NodeCpuResources{
-						CpuShares: 4096,
-					},
+					Processors: processorResources4096,
+					Cpu:        legacyCpuResources4096,
 					Memory: structs.NodeMemoryResources{
 						MemoryMB: 4096,
 					},
@@ -1055,8 +1063,9 @@ func TestBinPackIterator_Host_Network_Interpolation_Absent_Value(t *testing.T) {
 		},
 	}
 
-	binp := NewBinPackIterator(ctx, static, false, 0, testSchedulerConfig)
+	binp := NewBinPackIterator(ctx, static, false, 0)
 	binp.SetTaskGroup(taskGroup)
+	binp.SetSchedulerConfiguration(testSchedulerConfig)
 
 	scoreNorm := NewScoreNormalizationIterator(ctx, binp)
 
@@ -1077,9 +1086,8 @@ func TestBinPackIterator_Host_Network_Interpolation_Interface_Not_Exists(t *test
 					"some_network": "absent",
 				},
 				NodeResources: &structs.NodeResources{
-					Cpu: structs.NodeCpuResources{
-						CpuShares: 4096,
-					},
+					Processors: processorResources4096,
+					Cpu:        legacyCpuResources4096,
 					Memory: structs.NodeMemoryResources{
 						MemoryMB: 4096,
 					},
@@ -1156,8 +1164,9 @@ func TestBinPackIterator_Host_Network_Interpolation_Interface_Not_Exists(t *test
 		},
 	}
 
-	binp := NewBinPackIterator(ctx, static, false, 0, testSchedulerConfig)
+	binp := NewBinPackIterator(ctx, static, false, 0)
 	binp.SetTaskGroup(taskGroup)
+	binp.SetSchedulerConfiguration(testSchedulerConfig)
 
 	scoreNorm := NewScoreNormalizationIterator(ctx, binp)
 
@@ -1174,9 +1183,8 @@ func TestBinPackIterator_PlannedAlloc(t *testing.T) {
 				// Perfect fit
 				ID: uuid.Generate(),
 				NodeResources: &structs.NodeResources{
-					Cpu: structs.NodeCpuResources{
-						CpuShares: 2048,
-					},
+					Processors: processorResources2048,
+					Cpu:        legacyCpuResources2048,
 					Memory: structs.NodeMemoryResources{
 						MemoryMB: 2048,
 					},
@@ -1188,9 +1196,8 @@ func TestBinPackIterator_PlannedAlloc(t *testing.T) {
 				// Perfect fit
 				ID: uuid.Generate(),
 				NodeResources: &structs.NodeResources{
-					Cpu: structs.NodeCpuResources{
-						CpuShares: 2048,
-					},
+					Processors: processorResources2048,
+					Cpu:        legacyCpuResources2048,
 					Memory: structs.NodeMemoryResources{
 						MemoryMB: 2048,
 					},
@@ -1243,15 +1250,17 @@ func TestBinPackIterator_PlannedAlloc(t *testing.T) {
 			{
 				Name: "web",
 				Resources: &structs.Resources{
-					CPU:      1024,
-					MemoryMB: 1024,
+					CPU:       1024,
+					MemoryMB:  1014,
+					SecretsMB: 10,
 				},
 			},
 		},
 	}
 
-	binp := NewBinPackIterator(ctx, static, false, 0, testSchedulerConfig)
+	binp := NewBinPackIterator(ctx, static, false, 0)
 	binp.SetTaskGroup(taskGroup)
+	binp.SetSchedulerConfiguration(testSchedulerConfig)
 
 	scoreNorm := NewScoreNormalizationIterator(ctx, binp)
 
@@ -1270,17 +1279,30 @@ func TestBinPackIterator_PlannedAlloc(t *testing.T) {
 
 func TestBinPackIterator_ReservedCores(t *testing.T) {
 	state, ctx := testContext(t)
+
+	topology := &numalib.Topology{
+		Distances: numalib.SLIT{[]numalib.Cost{10}},
+		Cores: []numalib.Core{{
+			ID:        0,
+			Grade:     numalib.Performance,
+			BaseSpeed: 1024,
+		}, {
+			ID:        1,
+			Grade:     numalib.Performance,
+			BaseSpeed: 1024,
+		}},
+	}
+	topology.SetNodes(idset.From[hw.NodeID]([]hw.NodeID{0}))
+	legacyCpuResources, processorResources := cpuResourcesFrom(topology)
+
 	nodes := []*RankedNode{
 		{
 			Node: &structs.Node{
 				// Perfect fit
 				ID: uuid.Generate(),
 				NodeResources: &structs.NodeResources{
-					Cpu: structs.NodeCpuResources{
-						CpuShares:          2048,
-						TotalCpuCores:      2,
-						ReservableCpuCores: []uint16{0, 1},
-					},
+					Processors: processorResources,
+					Cpu:        legacyCpuResources,
 					Memory: structs.NodeMemoryResources{
 						MemoryMB: 2048,
 					},
@@ -1292,11 +1314,8 @@ func TestBinPackIterator_ReservedCores(t *testing.T) {
 				// Perfect fit
 				ID: uuid.Generate(),
 				NodeResources: &structs.NodeResources{
-					Cpu: structs.NodeCpuResources{
-						CpuShares:          2048,
-						TotalCpuCores:      2,
-						ReservableCpuCores: []uint16{0, 1},
-					},
+					Processors: processorResources,
+					Cpu:        legacyCpuResources,
 					Memory: structs.NodeMemoryResources{
 						MemoryMB: 2048,
 					},
@@ -1368,12 +1387,16 @@ func TestBinPackIterator_ReservedCores(t *testing.T) {
 				Resources: &structs.Resources{
 					Cores:    1,
 					MemoryMB: 1024,
+					NUMA: &structs.NUMA{
+						Affinity: "none",
+					},
 				},
 			},
 		},
 	}
-	binp := NewBinPackIterator(ctx, static, false, 0, testSchedulerConfig)
+	binp := NewBinPackIterator(ctx, static, false, 0)
 	binp.SetTaskGroup(taskGroup)
+	binp.SetSchedulerConfiguration(testSchedulerConfig)
 
 	scoreNorm := NewScoreNormalizationIterator(ctx, binp)
 
@@ -1392,9 +1415,8 @@ func TestBinPackIterator_ExistingAlloc(t *testing.T) {
 				// Perfect fit
 				ID: uuid.Generate(),
 				NodeResources: &structs.NodeResources{
-					Cpu: structs.NodeCpuResources{
-						CpuShares: 2048,
-					},
+					Processors: processorResources2048,
+					Cpu:        legacyCpuResources2048,
 					Memory: structs.NodeMemoryResources{
 						MemoryMB: 2048,
 					},
@@ -1406,9 +1428,8 @@ func TestBinPackIterator_ExistingAlloc(t *testing.T) {
 				// Perfect fit
 				ID: uuid.Generate(),
 				NodeResources: &structs.NodeResources{
-					Cpu: structs.NodeCpuResources{
-						CpuShares: 2048,
-					},
+					Processors: processorResources2048,
+					Cpu:        legacyCpuResources2048,
 					Memory: structs.NodeMemoryResources{
 						MemoryMB: 2048,
 					},
@@ -1482,8 +1503,9 @@ func TestBinPackIterator_ExistingAlloc(t *testing.T) {
 			},
 		},
 	}
-	binp := NewBinPackIterator(ctx, static, false, 0, testSchedulerConfig)
+	binp := NewBinPackIterator(ctx, static, false, 0)
 	binp.SetTaskGroup(taskGroup)
+	binp.SetSchedulerConfiguration(testSchedulerConfig)
 
 	scoreNorm := NewScoreNormalizationIterator(ctx, binp)
 
@@ -1507,9 +1529,8 @@ func TestBinPackIterator_ExistingAlloc_PlannedEvict(t *testing.T) {
 				// Perfect fit
 				ID: uuid.Generate(),
 				NodeResources: &structs.NodeResources{
-					Cpu: structs.NodeCpuResources{
-						CpuShares: 2048,
-					},
+					Processors: processorResources2048,
+					Cpu:        legacyCpuResources2048,
 					Memory: structs.NodeMemoryResources{
 						MemoryMB: 2048,
 					},
@@ -1521,9 +1542,8 @@ func TestBinPackIterator_ExistingAlloc_PlannedEvict(t *testing.T) {
 				// Perfect fit
 				ID: uuid.Generate(),
 				NodeResources: &structs.NodeResources{
-					Cpu: structs.NodeCpuResources{
-						CpuShares: 2048,
-					},
+					Processors: processorResources2048,
+					Cpu:        legacyCpuResources2048,
 					Memory: structs.NodeMemoryResources{
 						MemoryMB: 2048,
 					},
@@ -1602,8 +1622,9 @@ func TestBinPackIterator_ExistingAlloc_PlannedEvict(t *testing.T) {
 		},
 	}
 
-	binp := NewBinPackIterator(ctx, static, false, 0, testSchedulerConfig)
+	binp := NewBinPackIterator(ctx, static, false, 0)
 	binp.SetTaskGroup(taskGroup)
+	binp.SetSchedulerConfiguration(testSchedulerConfig)
 
 	scoreNorm := NewScoreNormalizationIterator(ctx, binp)
 
@@ -1884,10 +1905,13 @@ func TestBinPackIterator_Devices(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.Name, func(t *testing.T) {
-			require := require.New(t)
-
 			// Setup the context
 			state, ctx := testContext(t)
+
+			// Canonicalize resources
+			for _, task := range c.TaskGroup.Tasks {
+				task.Resources.Canonicalize()
+			}
 
 			// Add the planned allocs
 			if len(c.PlannedAllocs) != 0 {
@@ -1903,12 +1927,13 @@ func TestBinPackIterator_Devices(t *testing.T) {
 				for _, alloc := range c.ExistingAllocs {
 					alloc.NodeID = c.Node.ID
 				}
-				require.NoError(state.UpsertAllocs(structs.MsgTypeTestSetup, 1000, c.ExistingAllocs))
+				must.NoError(t, state.UpsertAllocs(structs.MsgTypeTestSetup, 1000, c.ExistingAllocs))
 			}
 
 			static := NewStaticRankIterator(ctx, []*RankedNode{{Node: c.Node}})
-			binp := NewBinPackIterator(ctx, static, false, 0, testSchedulerConfig)
+			binp := NewBinPackIterator(ctx, static, false, 0)
 			binp.SetTaskGroup(c.TaskGroup)
+			binp.SetSchedulerConfiguration(testSchedulerConfig)
 
 			out := binp.Next()
 			if out == nil && !c.NoPlace {
@@ -1918,7 +1943,7 @@ func TestBinPackIterator_Devices(t *testing.T) {
 			// Check we got the placements we are expecting
 			for tname, devices := range c.ExpectedPlacements {
 				tr, ok := out.TaskResources[tname]
-				require.True(ok)
+				must.True(t, ok)
 
 				want := len(devices)
 				got := 0
@@ -1926,23 +1951,132 @@ func TestBinPackIterator_Devices(t *testing.T) {
 					got++
 
 					expected, ok := devices[*placed.ID()]
-					require.True(ok)
-					require.Equal(expected.Count, len(placed.DeviceIDs))
+					must.True(t, ok)
+					must.Eq(t, expected.Count, len(placed.DeviceIDs))
 					for _, id := range expected.ExcludeIDs {
-						require.NotContains(placed.DeviceIDs, id)
+						must.SliceNotContains(t, placed.DeviceIDs, id)
 					}
 				}
 
-				require.Equal(want, got)
+				must.Eq(t, want, got)
 			}
 
 			// Check potential affinity scores
 			if c.DeviceScore != 0.0 {
-				require.Len(out.Scores, 2)
-				require.Equal(c.DeviceScore, out.Scores[1])
+				must.Len(t, 2, out.Scores)
+				must.Eq(t, c.DeviceScore, out.Scores[1])
 			}
 		})
 	}
+}
+
+// Tests that bin packing iterator fails due to overprovisioning of devices
+// This test has devices at task level
+func TestBinPackIterator_Device_Failure_With_Eviction(t *testing.T) {
+	_, ctx := testContext(t)
+	nodes := []*RankedNode{
+		{
+			Node: &structs.Node{
+				NodeResources: &structs.NodeResources{
+					Processors: processorResources4096,
+					Cpu:        legacyCpuResources4096,
+					Memory: structs.NodeMemoryResources{
+						MemoryMB: 4096,
+					},
+					Networks: []*structs.NetworkResource{},
+					Devices: []*structs.NodeDeviceResource{
+						{
+							Vendor: "nvidia",
+							Type:   "gpu",
+							Instances: []*structs.NodeDevice{
+								{
+									ID:                "1",
+									Healthy:           true,
+									HealthDescription: "healthy",
+									Locality:          &structs.NodeDeviceLocality{},
+								},
+							},
+							Name: "SOME-GPU",
+						},
+					},
+				},
+				ReservedResources: &structs.NodeReservedResources{
+					Cpu: structs.NodeReservedCpuResources{
+						CpuShares: 1024,
+					},
+					Memory: structs.NodeReservedMemoryResources{
+						MemoryMB: 1024,
+					},
+				},
+			},
+		},
+	}
+
+	// Add a planned alloc that takes up a gpu
+	plan := ctx.Plan()
+	plan.NodeAllocation[nodes[0].Node.ID] = []*structs.Allocation{
+		{
+			AllocatedResources: &structs.AllocatedResources{
+				Tasks: map[string]*structs.AllocatedTaskResources{
+					"web": {
+						Cpu: structs.AllocatedCpuResources{
+							CpuShares: 2048,
+						},
+						Memory: structs.AllocatedMemoryResources{
+							MemoryMB: 2048,
+						},
+						Networks: []*structs.NetworkResource{},
+						Devices: []*structs.AllocatedDeviceResource{
+							{
+								Vendor:    "nvidia",
+								Type:      "gpu",
+								Name:      "SOME-GPU",
+								DeviceIDs: []string{"1"},
+							},
+						},
+					},
+				},
+				Shared: structs.AllocatedSharedResources{},
+			},
+		},
+	}
+	static := NewStaticRankIterator(ctx, nodes)
+
+	// Create a task group with gpu device specified
+	taskGroup := &structs.TaskGroup{
+		EphemeralDisk: &structs.EphemeralDisk{},
+		Tasks: []*structs.Task{
+			{
+				Name: "web",
+				Resources: &structs.Resources{
+					CPU:      1024,
+					MemoryMB: 1024,
+					Networks: []*structs.NetworkResource{},
+					Devices: structs.ResourceDevices{
+						{
+							Name:  "nvidia/gpu",
+							Count: 1,
+						},
+					},
+					NUMA: &structs.NUMA{Affinity: structs.NoneNUMA},
+				},
+			},
+		},
+		Networks: []*structs.NetworkResource{},
+	}
+
+	binp := NewBinPackIterator(ctx, static, true, 0)
+	binp.SetTaskGroup(taskGroup)
+	binp.SetSchedulerConfiguration(testSchedulerConfig)
+
+	scoreNorm := NewScoreNormalizationIterator(ctx, binp)
+
+	out := collectRanked(scoreNorm)
+
+	// We expect a placement failure because we need 1 GPU device
+	// and the other one is taken
+	must.SliceEmpty(t, out)
+	must.Eq(t, 1, ctx.metrics.DimensionExhausted["devices: no devices match request"])
 }
 
 func TestJobAntiAffinity_PlannedAlloc(t *testing.T) {

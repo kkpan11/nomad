@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package checks
 
@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -20,7 +21,6 @@ import (
 	"github.com/hashicorp/nomad/nomad/mock"
 	"github.com/hashicorp/nomad/nomad/structs"
 	"github.com/shoenig/test/must"
-	"golang.org/x/exp/maps"
 	"oss.indeed.com/go/libtime/libtimetest"
 )
 
@@ -39,21 +39,34 @@ func TestChecker_Do_HTTP(t *testing.T) {
 
 	// create an http server with various responses
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// handle query param requests with string match because we want to
+		// test the path is set correctly instead of with escaped query params.
+		if strings.Contains(r.URL.Path, "query-param") {
+			if r.URL.RawQuery == "" {
+				w.WriteHeader(400)
+				_, _ = io.WriteString(w, "400 bad request")
+			} else {
+				w.WriteHeader(200)
+				_, _ = io.WriteString(w, "200 ok")
+			}
+			return
+		}
+
 		switch r.URL.Path {
 		case "/fail":
-			w.WriteHeader(500)
+			w.WriteHeader(http.StatusInternalServerError)
 			_, _ = io.WriteString(w, "500 problem")
 		case "/hang":
 			time.Sleep(1 * time.Second)
 			_, _ = io.WriteString(w, "too slow")
 		case "/long-fail":
-			w.WriteHeader(500)
+			w.WriteHeader(http.StatusInternalServerError)
 			_, _ = io.WriteString(w, tooLong)
 		case "/long-not-fail":
-			w.WriteHeader(201)
+			w.WriteHeader(http.StatusCreated)
 			_, _ = io.WriteString(w, tooLong)
 		default:
-			w.WriteHeader(200)
+			w.WriteHeader(http.StatusOK)
 			_, _ = io.WriteString(w, "200 ok")
 		}
 	}))
@@ -181,6 +194,16 @@ func TestChecker_Do_HTTP(t *testing.T) {
 			structs.CheckSuccess,
 			http.StatusCreated,
 			truncate,
+		),
+	}, {
+		name: "query param",
+		qc:   makeQueryContext(),
+		q:    makeQuery(structs.Healthiness, "query-param?a=b"),
+		expResult: makeExpResult(
+			structs.Healthiness,
+			structs.CheckSuccess,
+			http.StatusOK,
+			"nomad: http ok",
 		),
 	}}
 
@@ -363,6 +386,85 @@ func TestChecker_Do_HTTP_extras(t *testing.T) {
 			}
 
 			must.Eq(t, tc.headers, headers)
+		})
+	}
+}
+
+func TestChecker_Do_HTTPS_TLS(t *testing.T) {
+	ci.Parallel(t)
+
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		default:
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, "200 ok")
+		}
+	}))
+	defer ts.Close()
+
+	// get the address and port for https server
+	addr, port := splitURL(ts.URL)
+
+	// create a mock clock so we can assert time is set
+	now := time.Date(2022, 1, 2, 3, 4, 5, 6, time.UTC)
+	clock := libtimetest.NewClockMock(t).NowMock.Return(now)
+
+	testCases := []struct {
+		name                 string
+		inputTLSSkipVerify   bool
+		expectedStatusCode   int
+		expectedResultOutput string
+	}{
+		{
+			name:                 "tls skip verify true",
+			inputTLSSkipVerify:   true,
+			expectedStatusCode:   http.StatusOK,
+			expectedResultOutput: "nomad: http ok",
+		},
+		{
+			name:                 "tls skip verify false",
+			inputTLSSkipVerify:   false,
+			expectedStatusCode:   0,
+			expectedResultOutput: "tls: failed to verify certificate: x509",
+		},
+	}
+
+	for _, tc := range testCases {
+
+		queryContext := &QueryContext{
+			ID:               "abc123",
+			CustomAddress:    addr,
+			ServicePortLabel: port,
+			Networks:         nil,
+			NetworkStatus:    mock.NewNetworkStatus(addr),
+			Ports:            nil,
+			Group:            "group",
+			Task:             "task",
+			Service:          "service",
+			Check:            "check",
+		}
+
+		queryImpl := &Query{
+			Mode:          structs.Healthiness,
+			Type:          "http",
+			Timeout:       1 * time.Second,
+			AddressMode:   "auto",
+			PortLabel:     port,
+			Protocol:      "https",
+			Path:          "/",
+			Method:        http.MethodGet,
+			TLSSkipVerify: tc.inputTLSSkipVerify,
+		}
+
+		t.Run(tc.name, func(t *testing.T) {
+
+			c := New(testlog.HCLogger(t))
+			c.(*checker).clock = clock
+
+			result := c.Do(context.Background(), queryContext, queryImpl)
+
+			must.Eq(t, tc.expectedStatusCode, result.StatusCode)
+			must.StrContains(t, result.Output, tc.expectedResultOutput)
 		})
 	}
 }

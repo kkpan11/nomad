@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package command
 
@@ -10,10 +10,10 @@ import (
 	"reflect"
 	"strings"
 
+	"github.com/hashicorp/cli"
 	"github.com/hashicorp/nomad/api"
 	"github.com/hashicorp/nomad/helper/pointer"
 	colorable "github.com/mattn/go-colorable"
-	"github.com/mitchellh/cli"
 	"github.com/mitchellh/colorstring"
 	"github.com/posener/complete"
 	"golang.org/x/crypto/ssh/terminal"
@@ -117,6 +117,30 @@ func (m *Meta) AutocompleteFlags(fs FlagSetFlags) complete.Flags {
 		"-tls-server-name": complete.PredictNothing,
 		"-tls-skip-verify": complete.PredictNothing,
 		"-token":           complete.PredictAnything,
+	}
+}
+
+// askQuestion asks question to user until they provide a valid response.
+func (m *Meta) askQuestion(question string) bool {
+	for {
+		answer, err := m.Ui.Ask(m.Colorize().Color(fmt.Sprintf("[?] %s", question)))
+		if err != nil {
+			if err.Error() != "interrupted" {
+				m.Ui.Output(err.Error())
+				os.Exit(1)
+			}
+			os.Exit(0)
+		}
+
+		switch strings.TrimSpace(strings.ToLower(answer)) {
+		case "", "y", "yes":
+			return true
+		case "n", "no":
+			return false
+		default:
+			m.Ui.Output(fmt.Sprintf(`%q is not a valid response, please answer "yes" or "no".`, answer))
+			continue
+		}
 	}
 }
 

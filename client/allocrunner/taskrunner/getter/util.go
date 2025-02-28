@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package getter
 
@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"unicode"
@@ -18,6 +19,7 @@ import (
 	"github.com/hashicorp/go-getter"
 	"github.com/hashicorp/nomad/client/interfaces"
 	"github.com/hashicorp/nomad/helper/subproc"
+	"github.com/hashicorp/nomad/helper/users"
 	"github.com/hashicorp/nomad/nomad/structs"
 )
 
@@ -84,6 +86,36 @@ func getMode(artifact *structs.TaskArtifact) getter.ClientMode {
 	}
 }
 
+func chownDestination(destination, username string) error {
+	if destination == "" || username == "" {
+		return nil
+	}
+
+	if os.Geteuid() != 0 {
+		return nil
+	}
+
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+
+	uid, gid, _, err := users.LookupUnix(username)
+	if err != nil {
+		return err
+	}
+
+	return filepath.Walk(destination, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		return os.Chown(path, uid, gid)
+	})
+}
+
+func isInsecure(artifact *structs.TaskArtifact) bool {
+	return artifact.GetterInsecure
+}
+
 func getHeaders(env interfaces.EnvReplacer, artifact *structs.TaskArtifact) map[string][]string {
 	m := artifact.GetterHeaders
 	if len(m) == 0 {
@@ -143,10 +175,11 @@ func (s *Sandbox) runCmd(env *parameters) error {
 
 	// start & wait for the subprocess to terminate
 	if err := cmd.Run(); err != nil {
-		subproc.Log(output, s.logger.Error)
+		msg := subproc.Log(output, s.logger.Error)
+
 		return &Error{
 			URL:         env.Source,
-			Err:         fmt.Errorf("getter subprocess failed: %v", err),
+			Err:         fmt.Errorf("getter subprocess failed: %v: %v", err, msg),
 			Recoverable: true,
 		}
 	}

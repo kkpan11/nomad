@@ -1,6 +1,6 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 import Ember from 'ember';
@@ -94,6 +94,8 @@ export default Factory.extend({
 
   rescheduleAttempts: 0,
   rescheduleSuccess: false,
+
+  withPausedTasks: false,
 
   rescheduled: trait({
     // Create another allocation carrying the events of this as well as the reschduleSuccess state.
@@ -212,6 +214,8 @@ export default Factory.extend({
         server.create('task-state', {
           allocation,
           name: server.db.tasks.find(id).name,
+          paused: allocation.withPausedTasks ? 'scheduled_pause' : null,
+          state: allocation.clientStatus,
         })
       );
 

@@ -1,6 +1,6 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 import { run } from '@ember/runloop';
@@ -23,6 +23,7 @@ module('Unit | Adapter | Node', function (hooks) {
     this.server.create('region', { id: 'region-1' });
     this.server.create('region', { id: 'region-2' });
 
+    this.server.create('node-pool');
     this.server.create('node', { id: 'node-1' });
     this.server.create('node', { id: 'node-2' });
     this.server.create('job', { id: 'job-1', createAllocations: false });

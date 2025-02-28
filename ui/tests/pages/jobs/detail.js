@@ -1,6 +1,6 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 import {
@@ -43,6 +43,11 @@ export default create({
   stop: twoStepButton('[data-test-stop]'),
   start: twoStepButton('[data-test-start]'),
   purge: twoStepButton('[data-test-purge]'),
+  revert: twoStepButton('[data-test-revert]'),
+  editAndResubmit: {
+    scope: '[data-test-edit-and-resubmit]',
+    click: clickable(),
+  },
 
   packTag: isPresent('[data-test-pack-tag]'),
   metaTable: isPresent('[data-test-meta]'),
@@ -108,13 +113,17 @@ export default create({
     scope: '[data-test-jobs-header]',
     hasSubmitTime: isPresent('[data-test-jobs-submit-time-header]'),
     hasNamespace: isPresent('[data-test-jobs-namespace-header]'),
+    hasNodePool: isPresent('[data-test-jobs-node-pool-header]'),
+    hasType: isPresent('[data-test-jobs-type-header]'),
+    hasPriority: isPresent('[data-test-jobs-priority-header]'),
   },
 
   jobs: collection('[data-test-job-row]', {
     id: attribute('data-test-job-row'),
     name: text('[data-test-job-name]'),
-    namespace: text('[data-test-job-namespace]'),
     link: attribute('href', '[data-test-job-name] a'),
+    namespace: text('[data-test-job-namespace]'),
+    nodePool: text('[data-test-job-node-pool]'),
     submitTime: text('[data-test-job-submit-time]'),
     status: text('[data-test-job-status]'),
     type: text('[data-test-job-type]'),

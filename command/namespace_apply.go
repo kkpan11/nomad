@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package command
 
@@ -34,7 +34,9 @@ Usage: nomad namespace apply [options] <input>
   Instead of a file, you may instead pass the namespace name to create
   or update as the only argument.
 
-  If ACLs are enabled, this command requires a management ACL token.
+  If ACLs are enabled, this command requires a management ACL token. In
+  federated clusters, the namespace will be created in the authoritative region
+  and will be replicated to all federated regions.
 
 General Options:
 
@@ -224,6 +226,9 @@ func parseNamespaceSpecImpl(result *api.Namespace, list *ast.ObjectList) error {
 
 	delete(m, "capabilities")
 	delete(m, "meta")
+	delete(m, "node_pool_config")
+	delete(m, "vault")
+	delete(m, "consul")
 
 	// Decode the rest
 	if err := mapstructure.WeakDecode(m, result); err != nil {
@@ -242,6 +247,54 @@ func parseNamespaceSpecImpl(result *api.Namespace, list *ast.ObjectList) error {
 				return err
 			}
 			result.Capabilities = opts
+			break
+		}
+	}
+
+	npObj := list.Filter("node_pool_config")
+	if len(npObj.Items) > 0 {
+		for _, o := range npObj.Elem().Items {
+			ot, ok := o.Val.(*ast.ObjectType)
+			if !ok {
+				break
+			}
+			var npConfig *api.NamespaceNodePoolConfiguration
+			if err := hcl.DecodeObject(&npConfig, ot.List); err != nil {
+				return err
+			}
+			result.NodePoolConfiguration = npConfig
+			break
+		}
+	}
+
+	vObj := list.Filter("vault")
+	if len(vObj.Items) > 0 {
+		for _, o := range vObj.Elem().Items {
+			ot, ok := o.Val.(*ast.ObjectType)
+			if !ok {
+				break
+			}
+			var vConfig *api.NamespaceVaultConfiguration
+			if err := hcl.DecodeObject(&vConfig, ot.List); err != nil {
+				return err
+			}
+			result.VaultConfiguration = vConfig
+			break
+		}
+	}
+
+	conObj := list.Filter("consul")
+	if len(conObj.Items) > 0 {
+		for _, o := range conObj.Elem().Items {
+			ot, ok := o.Val.(*ast.ObjectType)
+			if !ok {
+				break
+			}
+			var cConfig *api.NamespaceConsulConfiguration
+			if err := hcl.DecodeObject(&cConfig, ot.List); err != nil {
+				return err
+			}
+			result.ConsulConfiguration = cConfig
 			break
 		}
 	}
